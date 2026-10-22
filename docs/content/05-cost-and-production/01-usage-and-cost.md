@@ -44,7 +44,7 @@ print(sum(0.20 / 1_000_000 for _ in range(1_000_000)))
 print(sum(Decimal("0.20") / 1_000_000 for _ in range(1_000_000)))
 ```
 
-The pricing module therefore calculates in `Decimal` and converts to `float` only at the edge (JSON and SQLite's `REAL`).
+The pricing module therefore calculates in `Decimal` and converts to `float` only at the edge (JSON and the database's `double precision` column).
 
 ## The code
 

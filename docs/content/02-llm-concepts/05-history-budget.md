@@ -104,7 +104,7 @@ Plain truncation forgets the oldest messages. For a long chat that loses facts (
 - The model is stateless, so history is resent each turn; a **budget** keeps cost and latency bounded.
 - Only messages the user actually saw count: `complete` and `cancelled` yes, `error`, `streaming` and empty no.
 - Walk **newest to oldest**, stop at the **first misfit** (no holes), always keep the **newest user message**, always **start with a user turn**.
-- `build_history` is a **pure function**: rows in, messages out. No HTTP, no SQLite, no OpenAI, which makes it trivial to test.
+- `build_history` is a **pure function**: rows in, messages out. No HTTP, no database, no OpenAI, which makes it trivial to test.
 - The budget is an estimate; billing uses the provider's exact usage.
 :::
 

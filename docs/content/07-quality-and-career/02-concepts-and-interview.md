@@ -39,14 +39,27 @@ This lesson is for revision. First a map from each idea to *where it lives in th
 | Optimistic UI | show the result before the server confirms | `Chat.tsx` |
 | Safe rendering | LLM output is untrusted | `SafeMarkdown` |
 | Test doubles | scripted model, SDK stub, network blocker | `tests/helpers.py`, `conftest.py` |
-| Evals | scored questions that measure quality | *not implemented (be honest about it)* |
+| Authentication | prove who is calling | `auth/` (argon2id, JWT), `current_user` |
+| JWT | a signed (not encrypted) token with `sub` and `exp` | `create_token`, `decode_token` |
+| Authorization / tenant isolation | every query filtered by owner; 404 not 403 | `Database.get_conversation`, `require_conversation` |
+| Migrations | numbered SQL files applied once each, in a transaction | `app/migrations.py`, `AI/migrations/` |
+| Connection pool | reuse connections instead of opening one per query | `Database.connect` |
+| RAG | retrieve relevant passages, answer from only those | `app/rag/`, `DocumentSearch` |
+| Embedding | a vector that represents meaning; cosine similarity | `OpenAIEmbedder`, `chunks.embedding` |
+| Chunking | split into overlapping, paragraph-aware passages | `chunk_pages` |
+| Vector index (HNSW) | approximate nearest neighbours, fast | `idx_chunks_embedding` (pgvector) |
+| Hybrid search / RRF | vector + keyword, merged by rank | `Database.search_chunks` |
+| Untrusted uploads | allowlist, content check, zip-bomb guard, limits | `detect_kind`, `extract` |
+| Background processing | answer 202, finish later, expose a status | `DocumentManager` |
+| Retrieval metrics | hit@k and MRR on a gold set | `tests/test_rag_quality.py` |
+| Evals (answer quality) | scored questions that measure quality | *not implemented (be honest about it)* |
 
 ## Questions and answers
 
 ### Fundamentals
 
 **Why does a chat app resend the whole conversation on every request?**
-Because the model is stateless: it keeps nothing between calls. "Memory" is the app's job: store the messages and send the relevant ones each time. Streambot rebuilds the history from SQLite for every request, never trusting the browser, and sets `store=False` so OpenAI keeps nothing.
+Because the model is stateless: it keeps nothing between calls. "Memory" is the app's job: store the messages and send the relevant ones each time. Streambot rebuilds the history from the database for every request, never trusting the browser, and sets `store=False` so OpenAI keeps nothing.
 
 **What is a token, and why do you care?**
 A chunk of text, roughly four characters in English. Cost and limits are both counted in tokens, with output priced several times higher than input. I use an *estimate* (`len//4 + 4`) only for budgeting, and the provider's exact `usage` for billing, and I have a test ensuring the estimate never appears in billing code.
@@ -113,10 +126,44 @@ The provider caches the processed prefix of long prompts and bills repeats at a 
 **Why is a deleted chat's spend still counted?**
 Because the tokens were spent. Deleting a chat removes its content, but each reply's usage numbers (never its text) are archived in the same transaction, on their original date.
 
+### Accounts and data
+
+**How does your login work?**
+Passwords are stored as argon2id hashes. On login the server verifies the hash and returns a JWT: `header.payload.signature`, signed with a server secret, carrying the user id and an expiry (7 days). The browser sends it as a Bearer token; the server verifies the signature and expiry and loads the user. There is no session table. The trade-off is that a stateless token cannot be revoked before it expires.
+
+**How do you stop one user reading another's chats?**
+Every row has an owner and every query filters on it, so someone else's chat id finds nothing, and I answer `404`, not `403`, so ids cannot be used to probe accounts. Retrieval filters on user *and* chat inside the SQL. A test walks the route table to prove every route needs a token, and another has a second account try to read, upload to and delete from the first account's chat.
+
+**Why 404 instead of 403 for another user's data?**
+`403` says "it exists but you cannot see it", which leaks information. `404` is the same answer as a chat that does not exist.
+
+**How do you change the database schema safely?**
+Versioned SQL migrations: numbered files applied in order, each once, recorded in a table, all in one transaction under an advisory lock. A shipped migration is never edited; a change is a new file.
+
+**Why PostgreSQL instead of SQLite?**
+Many users writing at once, constraints and cascades enforced by the server, real migrations, and pgvector so embeddings live beside the data, in the same transaction.
+
+### Retrieval (RAG)
+
+**Explain how a question about an attached PDF gets answered.**
+At upload the file is validated, text is extracted per page, split into overlapping paragraph-aware chunks, each chunk is embedded (1,536 numbers) and stored in pgvector with its page and heading. When you ask, the model decides to call a `search_documents` tool; the query is embedded, and one SQL statement finds the nearest vectors and the best keyword matches for this user's chat, merges them with Reciprocal Rank Fusion, and returns the top passages, which become numbered citations.
+
+**Why hybrid search, not just vectors?**
+Vectors find meaning but can miss exact names and codes; keywords find exact words but miss paraphrases. RRF merges the two rankings by rank (`1/(60+rank)` each), so passages both methods like win, with nothing to tune.
+
+**Why is retrieval a tool and not always-on context?**
+The model decides when a search is needed (a greeting needs none), writes a self-contained query from the conversation, can search more than once, and chats without files cost nothing.
+
+**How do you protect against a malicious document?**
+Uploads are validated by content, not just extension, with size, page and zip-bomb limits. Document text is labelled as data, not instructions; the tools are read-only; search is scoped to the user's own chat; output is rendered as inert text. That reduces prompt-injection risk but cannot remove it, which is why capabilities, not wording, are the real defence.
+
+**How do you know retrieval is good?**
+I have a small gold set (question plus the phrase the right passage contains) measured with hit@k and MRR, which caught a real bug (AND-ed keyword matching returned nothing for natural questions). It runs with a stand-in embedder, so it validates the plumbing; I have not yet measured quality with the real embedding model on real documents.
+
 ### Production
 
 **What would you change to put this in production?**
-Authentication and per-user data, PostgreSQL, a shared rate-limit store, spend alerts and an agent-loop ceiling, observability (traces, metrics), CI and deployment, moderation and a retention policy, and an evaluation harness for answer quality.
+Deployment and CI, revocable sessions (refresh tokens, `httpOnly` cookie, email verification), a shared rate-limit store, spend alerts and an agent-loop ceiling, observability (traces, metrics), indexing in a worker queue with OCR, a re-ranker, moderation and a retention policy, and an evaluation harness for answer quality.
 
 **How do you know the app works without calling OpenAI in tests?**
 A scripted model and an SDK stub cover the pipeline and the adapter, an autouse fixture makes any real network call fail, and a live-server test proves disconnect handling. The real integration was checked once by hand with a strict call ceiling. The tests do not prove answer quality; evals would.
@@ -136,7 +183,7 @@ A stale closure: React ran a state updater after I had reassigned the assistant'
 - Learn the **map**: for every concept, know *what it is*, *why it exists* and *where it lives in the code*.
 - Answer in layers: a clear one-sentence answer first, then the reason, then the code or the number that proves it.
 - Prefer **specific** answers ("2,439 of 2,442 tokens cached, about 86% cheaper") to general ones.
-- Be honest about limits: no evals, no auth, single user. Saying so is a strength.
+- Be honest about limits: no answer-quality evals, not deployed, embeddings not yet verified live, basic (non-revocable) auth. Saying so is a strength.
 :::
 
 :::exercise Teach it back
@@ -151,7 +198,7 @@ Pick any three rows of the concept map and explain each to a friend who has neve
 > That is the rule in `stream_with_retry`.
 
 ? Which number best shows prompt caching working?
-- 262 tests.
+- 440 tests.
 + The second identical request had 2,439 of 2,442 input tokens cached and cost about 86% less.
 - 5 sources.
 > Concrete, measured evidence is what makes a claim credible.

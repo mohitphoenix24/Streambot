@@ -8,7 +8,7 @@ tags: testing, pytest, test doubles, stubs, Vitest, real-API verification
 
 Testing an LLM app has two awkward problems. The model is **slow, costs money and gives different answers each time**, and so is the network. If every test called OpenAI, the suite would be slow, expensive and flaky. Streambot's answer is to test *everything around the model* thoroughly and cheaply, and to verify the model integration against the real API only occasionally, by hand, with a hard cost ceiling.
 
-At the time of writing there are **262 backend tests** (pytest, running in about 8 seconds) and **38 frontend tests** (Vitest). **None of them calls OpenAI or Tavily.**
+At the time of writing there are **more than 440 backend tests** (pytest, about 25 seconds, running against a real PostgreSQL) and **70 frontend tests** (Vitest). **None of them calls OpenAI or Tavily.**
 
 ## The strategy: one wall, two stand-ins
 
@@ -36,6 +36,18 @@ To test the adapter itself, a tiny fake mimics only the parts of the OpenAI clie
 ```
 
 With it, a test can feed the adapter any sequence of SDK events, including ones that raise, and check how `client.py` maps them.
+
+## A real database, and fakes for everything that costs money
+
+The model and the network are replaced; **the database is not**. Constraints, cascades, the pgvector indexes and the hybrid search query are *the database's* behaviour, so a mock would prove nothing. Instead, every test gets its **own throwaway PostgreSQL database**, cloned from a template that has all migrations applied (cloning is a file copy inside Postgres, tens of milliseconds):
+
+```python src="AI/tests/conftest.py" fn="database_url,db"
+```
+
+For the document features there are three more doubles. `FakeEmbedder` returns deterministic vectors (hashed words) and can be told to fail; `make_pdf` and `make_docx` build **real** files in memory, so the real parsers run; and the OpenAI embedder itself is tested against a stub SDK client, like the chat adapter.
+
+```python src="AI/tests/helpers.py" fn="FakeEmbedder"
+```
 
 ## A safety net, not just good intentions
 
@@ -84,7 +96,12 @@ Every rule in this guide has a test that would fail if the rule were broken. A f
 | `test_usage_cost.py`, `test_pricing.py` | exact cost arithmetic, cached and reasoning tokens, unknown prices |
 | `test_usage_report.py` | totals, cache stats, time zones, deleted chats, unpriced calls |
 | `test_web_search.py` | Tavily parsing, URL filtering, safe errors, citation numbering |
-| `test_db.py` | constraints, crash recovery, summaries, archive-on-delete, **upgrading old database files** |
+| `test_db.py`, `test_migrations.py` | constraints, crash recovery, summaries, archive-on-delete; the **migration runner** (order, only-missing, rollback of a failing file) |
+| `test_auth.py`, `test_cli.py` | passwords, JWT (expiry, tampering, `alg: none`), sign-up/login, a walk of **every route** proving it needs a token, users isolated from each other; the admin commands |
+| `test_rag_extract.py`, `test_rag_chunker.py` | reading PDF/Word/text safely and refusing disguised files, zip bombs, encrypted or empty PDFs; chunk size, overlap, pages and headings |
+| `test_rag_store.py`, `test_rag_ingest.py` | chunks and **hybrid search on real pgvector**, isolation between chats and users, cascades, atomic writes; background indexing outcomes, the OpenAI embedder, the document tool |
+| `test_attachments_api.py` | upload/list/delete over HTTP, every limit and refusal, another user's access, and a full "ask about the file, get a cited answer" round trip |
+| `test_rag_quality.py` | a small **gold set**: hit@k and MRR for hybrid vs vector-only retrieval |
 | `test_limits_config.py`, `test_fx.py`, `test_sse.py` | rate limiter, configuration, exchange rate, the wire format |
 
 The live cancellation test deserves a mention. In-process tests cannot prove that a server notices a client hanging up, so this one starts a genuine server, opens a streaming request, **closes the socket mid-stream** (exactly what `AbortController.abort()` does in a browser), and checks the database and that the model stream was closed.
@@ -94,12 +111,14 @@ The live cancellation test deserves a mention. In-process tests cannot prove tha
 ```text
 sse.test.ts     the parser fed one character at a time, split in the middle of a terminator, CRLF, comments
 cite.test.ts    [1] and [2][3] become links only for real sources, never inside code
+auth.test.ts    token expiry read without verifying, storage that may throw, the 401 hook
+documents.test.ts  which files are accepted, list updates, status text, real file drags only
 math.test.ts    \( \) and \[ \] rewritten, code left alone, dollar amounts untouched
 chart.test.ts   axis maths, label thinning, tiny values stay visible
 format.test.ts  money formatting: USD and INR side by side, "cost n/a" for unknown
 ```
 
-These are the *pure* parts of the client. A browser end-to-end check (Playwright driving the real UI against a real backend with a scripted model) was run by hand during development to check things like streaming, Stop, delete, citations and layout, but it is not part of the committed suite.
+These are the *pure* parts of the client. Browser end-to-end checks (Playwright driving the real UI against a real backend and a real PostgreSQL, with a scripted model and the fake embedder) were run by hand for sign-up and login, isolation between two accounts, streaming, Stop, delete, citations, and the whole attachment flow (refused file, draft chat, drag and drop, status, a cited answer, removal), but they are not part of the committed suite.
 
 ## Verified against the real API, by hand
 
@@ -111,14 +130,16 @@ The stand-ins prove the code handles the *shapes* the SDK produces. They cannot 
 | web search | the model searched **twice on its own**, got 10 sources, answered and titled the chat |
 | rolling memory | the real model summarised, then **merged** new messages into the summary |
 | prompt caching | the same prompt twice: **2,439 of 2,442** tokens cached the second time, about **86% cheaper** |
+| **attachments (embeddings)** | **not yet verified.** Everything around the embedding call is tested with stand-ins, but the real `text-embedding-3-small` call, its reported usage and the price entry have not been exercised against the live API |
 
 :::note Stand-ins prove the adapter, not the model
-None of this proves the model gives *good* answers. For that you need **evaluations** ("evals"): a fixed set of questions scored automatically or by a judge model. Streambot does not have an eval harness, and saying so is part of being honest about what is and is not proven.
+None of this proves the model gives *good* answers. For that you need **evaluations** ("evals"): a fixed set of questions scored automatically or by a judge model. Streambot has a small **retrieval** gold set (does the right passage come back? see the retrieval lesson), but it runs with a stand-in embedder, so it checks the plumbing, not OpenAI's embedding quality. It has **no answer-quality evals**, and saying so is part of being honest about what is and is not proven.
 :::
 
 ## What is not tested
 
-- **Answer quality** (no evals).
+- **Answer quality** (no evals), and **retrieval quality with the real embedding model** on real documents.
+- **The real embedding API** end to end (the next verification to do, and a cheap one).
 - **Load and concurrency** at scale (it is a single-process app).
 - **A committed end-to-end browser suite**.
 - **Failures that only happen against the real API**: a genuine 429 or a mid-stream network drop are simulated, not observed.
@@ -126,7 +147,8 @@ None of this proves the model gives *good* answers. For that you need **evaluati
 ## Run them
 
 ```bash
-cd AI && source .venv/bin/activate && pytest -q          # backend: no network, about 8 seconds
+docker compose up -d postgres                             # the tests use a real PostgreSQL
+cd AI && source .venv/bin/activate && pytest -q          # backend: no OpenAI, about 25 seconds
 cd frontend && npm run typecheck && npm test              # frontend: types, then the unit tests
 ```
 
@@ -137,7 +159,8 @@ cd frontend && npm run typecheck && npm test              # frontend: types, the
 - Add a **safety net** (`autouse` fixture) so an accidental real call fails loudly.
 - Every hard-won rule has a test; some tests even **read the source** to enforce a rule.
 - A **live** test (real server, real socket) is the only way to prove disconnect handling.
-- State what the tests do **not** prove: answer quality needs **evals**.
+- Use a **real database** for anything the database enforces; fake only what costs money or needs the network.
+- State what the tests do **not** prove: answer quality needs **evals**, and an unverified integration should be called unverified.
 :::
 
 :::exercise Write the test first

@@ -1,6 +1,6 @@
 # Streambot Guide
 
-An interactive tutorial on how Streambot works: the architecture, every generative-AI idea in it, and the real code, explained in plain English first. 17 lessons, with examples that run in your browser.
+An interactive tutorial on how Streambot works: the architecture, every generative-AI idea in it, and the real code, explained in plain English first. 21 lessons, with examples that run in your browser.
 
 ## Open it
 
@@ -19,6 +19,7 @@ Python examples (marked **▶ Run**) execute in your browser with Pyodide, which
 | Start here | What Streambot is · The architecture and the life of one message |
 | How an LLM chat works | Tokens, statelessness and the request · The model layer · Streaming with SSE, Stop and crash recovery · Persistence · History and the token budget · Rolling-summary memory |
 | Agents: tools and citations | Tool calling and the agent loop · Web search and citations |
+| Accounts and documents (RAG) | Accounts and login with JWT · RAG: embeddings, chunks and pgvector · Retrieval: hybrid search and the document tool · The upload pipeline |
 | Cost, caching and production | Usage, pricing and cost accounting · Prompt caching and the Usage page · Reliability, security and limits |
 | The React client | Reading the stream, state, safe rendering |
 | Quality and career | Testing without the network · Concept map and interview answers · Where this stands: résumé value and next steps |

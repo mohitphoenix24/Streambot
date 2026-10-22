@@ -22,7 +22,7 @@ request 2:  [user: My name is Mohit., assistant: Nice to meet you., user: What i
             -> "Your name is Mohit."
 ```
 
-So "memory" in a chat product is something the *app* does: store the messages, and send the relevant ones each time. Streambot stores them in SQLite and rebuilds the list on every request. That is the whole of [History and the token budget](#/l/history-budget), and the smarter version is [Rolling-summary memory](#/l/rolling-memory).
+So "memory" in a chat product is something the *app* does: store the messages, and send the relevant ones each time. Streambot stores them in PostgreSQL and rebuilds the list on every request. That is the whole of [History and the token budget](#/l/history-budget), and the smarter version is [Rolling-summary memory](#/l/rolling-memory).
 
 :::analogy The goldfish consultant
 Imagine hiring a brilliant consultant with a three-second memory. To get a useful answer you hand over a folder with the whole case file every single time. A good assistant app is the person who keeps that folder tidy: not too thick (cost and speed), not missing anything important (quality).

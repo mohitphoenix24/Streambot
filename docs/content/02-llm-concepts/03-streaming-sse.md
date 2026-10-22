@@ -95,7 +95,7 @@ Four things happen for every event:
 
 1. **Is the browser still there?** `request.is_disconnected()` is the first way to notice a Stop (below).
 2. **First token?** The first `TextDelta` records the TTFT.
-3. **Checkpoint.** About once a second (`PARTIAL_FLUSH_INTERVAL_S`) the text so far is written to SQLite. Writing on *every* token would be wasteful, but holding the whole answer only in memory would lose it in a crash.
+3. **Checkpoint.** About once a second (`PARTIAL_FLUSH_INTERVAL_S`) the text so far is written to the database. Writing on *every* token would be wasteful, but holding the whole answer only in memory would lose it in a crash.
 4. **Forward.** The delta becomes an SSE `delta` event, and the browser shows it immediately.
 
 ### Part 3: tools and the healthy end
@@ -122,7 +122,7 @@ Two kinds of trouble, handled very differently:
 
 This is the most important block in the file. Whatever happened (success, handled error, disconnect or cancellation), control arrives here and writes the final state to the database. Notice two deliberate choices:
 
-- **There is no `await` inside it.** The SQLite writes are plain synchronous calls, so even a task that is *being cancelled* cannot be interrupted halfway through saving.
+- **There is no `await` inside it.** The database writes are plain synchronous calls (on pooled connections: see the persistence lesson), so even a task that is *being cancelled* cannot be interrupted halfway through saving.
 - **Partial text is never replaced by a blank.** An errored or stopped reply keeps whatever arrived, and usage is stored only if the provider actually reported it.
 
 ## The status machine
@@ -210,6 +210,6 @@ For each situation, say which status the reply ends with and whether an SSE even
 ? Why does the `finally` block contain no `await`?
 - await is not allowed in finally.
 + So a task that is being cancelled cannot be interrupted halfway through saving the final state.
-- Because SQLite is slow.
-> The SQLite writes are plain synchronous calls: they either run completely or not at all.
+- Because the database is slow.
+> The database writes are plain synchronous calls: nothing can interrupt them halfway, so the save either runs completely or not at all.
 ```

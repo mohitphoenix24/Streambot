@@ -39,6 +39,11 @@ The model learns what a tool does from its **description and schema**. They are 
 ```python src="AI/app/tools/registry.py" fn="WEB_SEARCH,WEB_SEARCH_GUIDANCE"
 ```
 
+Streambot has a **second tool**, `search_documents`, which searches the files you attached to the chat (see the RAG lessons). It is offered **only when the chat has a ready attachment**, so a chat without files never even sees it; `ToolRunner.definitions` decides which tools go into each request. The loop below is identical for both tools, which is the point of the design.
+
+```python src="AI/app/tools/registry.py" fn="SEARCH_DOCUMENTS,DOCUMENT_GUIDANCE"
+```
+
 - `type: "function"` and `name` identify it.
 - `description` tells the model *when* it is useful. Models pick tools based on this text, so it is worth writing carefully.
 - `parameters` is a **JSON Schema**: one required string, `query`. With `strict: True` and `additionalProperties: False`, the model is held to exactly that shape.

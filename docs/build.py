@@ -122,7 +122,7 @@ def ts_extract(rel: str, names: list[str]) -> str:
     lines = read_source(rel).splitlines()
     parts = []
     for name in names:
-        pat = re.compile(rf"^(export\s+)?(default\s+)?(async\s+)?(function|const|let|class|interface|type)\s+{re.escape(name)}\b")
+        pat = re.compile(rf"^\s*(export\s+)?(default\s+)?(async\s+)?(function|const|let|class|interface|type)\s+{re.escape(name)}\b")  # \s*: nested functions too
         start = next((i for i, l in enumerate(lines) if pat.match(l)), None)
         if start is None:
             fail(f"{rel}: no declaration named '{name}'")
@@ -144,7 +144,7 @@ def ts_extract(rel: str, names: list[str]) -> str:
         top = start
         while top > 0 and (lines[top - 1].lstrip().startswith(("//", "/*", "*", "*/"))):
             top -= 1
-        parts.append("\n".join(lines[top:end + 1]))
+        parts.append(textwrap.dedent("\n".join(lines[top:end + 1])))  # a nested function is shown without its indentation
     return "\n\n".join(parts)
 
 

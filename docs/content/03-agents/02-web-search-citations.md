@@ -49,11 +49,13 @@ Each result gets the next number (`len(self._numbered) + …`), the numbers cont
 The Python 3.15 series first became stable with Python 3.15.0 on October 9, 2026...
 ```
 
+The same runner also serves the **document search** tool (the next module): web pages and passages from your attached files share **one** numbering, so a reply that used both still has an unambiguous `[1]`, `[2]`, … A source records its `kind` (`web` or `document`), and for documents a `page` instead of a URL.
+
 A tool error does not raise: it becomes the text `Error: Web search is unavailable right now.`, sent back to the model as the function output. The model can then apologise, or answer from what it knows, instead of the whole reply failing.
 
 Here is the **real `ToolRunner`** running with a pretend search engine. (Async code normally needs an event loop; this demo drives the coroutine by hand, which works because the fake search never actually waits.)
 
-```python run include="AI/app/tools/web_search.py:SNIPPET_CHARS,Source,ToolError|AI/app/tools/registry.py:log,WEB_SEARCH,WEB_SEARCH_GUIDANCE,ToolOutcome,ToolRunner" title="ToolRunner: numbering across two searches" level=medium
+```python run include="AI/app/tools/web_search.py:SNIPPET_CHARS,Source,ToolError|AI/app/tools/registry.py:log,WEB_SEARCH,WEB_SEARCH_GUIDANCE,SEARCH_DOCUMENTS,DOCUMENT_GUIDANCE,ToolOutcome,_model_line,ToolRunner" title="ToolRunner: numbering across two searches" level=medium
 class FakeSearch:
     """Stands in for Tavily: the first query finds 2 pages, the second finds 2 more."""
     def __init__(self):
@@ -113,7 +115,7 @@ Two small defences live in that snippet. `safeUrl` only returns `http(s)` URLs (
 ```tsx src="frontend/src/Message.tsx" fn="ToolSteps,Sources"
 ```
 
-`ToolSteps` shows the live rows that come from the `tool_call` and `tool_result` events while the model works. `Sources` is the list under the answer. It is an **accordion** (a toggle with a chevron, open by default) because a long search can collect many sources and you may want to fold them away.
+`ToolSteps` shows the live rows that come from the `tool_call` and `tool_result` events while the model works ("Searching the web…" or "Searching your documents…"). `Sources` is the list under the answer; a web source is a link card, while a document source is a card that expands to show the passage. It is an **accordion** (a toggle with a chevron, open by default) because a long search can collect many sources and you may want to fold them away.
 
 ## What gets stored
 

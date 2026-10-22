@@ -15,6 +15,8 @@ The server is only half of streaming. The browser has to *read* a response that 
 | read the byte stream and rebuild SSE events | `api.ts`, `sse.ts` |
 | keep the chat state: messages, totals, banners | `Chat.tsx` |
 | show a reply while it streams, and render it properly when it ends | `Message.tsx` |
+| keep the login: token storage, "who am I", sign out on 401 | `auth.ts`, `AuthContext.tsx`, `Login.tsx` |
+| attach files, show their indexing status, show document citations | `Chat.tsx`, `documents.ts`, `Message.tsx` |
 | keep the URL, the sidebar and drafts in sync | `App.tsx` |
 | draw the Usage page | `Usage.tsx`, `chart.ts` |
 
@@ -160,17 +162,62 @@ Afterwards it re-syncs with the database shortly, because the server records how
 
 ## Drafts, and a new chat on launch
 
-Opening the app starts a **new chat**, like ChatGPT, but without filling your sidebar with empty chats. A "New chat" is only a draft in the browser; nothing exists on the server until you send the first message:
+Opening the app starts a **new chat**, like ChatGPT, but without filling your sidebar with empty chats. A "New chat" is only a draft in the browser; nothing exists on the server until you send the first message *or attach the first file*:
 
-```tsx src="frontend/src/Chat.tsx" from="if (!idRef.current) {" to="const convId = idRef.current as string;"
+```tsx src="frontend/src/Chat.tsx" fn="ensureConversation"
 ```
 
-Note `idRef`, a `useRef`, rather than state. The id changes *while a stream is running*. Changing state would re-run effects and remount the component, which would abort the very reply being started. A ref changes without re-rendering.
+Both `send()` and `attach()` call this, so the "create it on first use" rule lives in one place. Note `idRef`, a `useRef`, rather than state. The id changes *while a stream is running*. Changing state would re-run effects and remount the component, which would abort the very reply being started. A ref changes without re-rendering.
 
 The selected chat lives in the URL hash (`#/c/<id>`), so refresh, bookmarks and the back button all work. But a *fresh launch* should open a new chat even if the address still carries an old id, while a *refresh* should keep the chat. `sessionStorage` lives exactly as long as a tab, which is the difference:
 
 ```tsx src="frontend/src/App.tsx" from="(function startNewChatOnLaunch() {" to="})();"
 ```
+
+## Login in the browser
+
+Every request now needs a token, so the client has a small login layer. `api.ts` wraps `fetch` so the token is attached in one place, and a `401` anywhere means "your login no longer works":
+
+```ts src="frontend/src/api.ts" fn="authHeaders,authedFetch"
+```
+
+`AuthContext` is a tiny state machine (`checking` · `anonymous` · `authenticated` · `unreachable`) that decides whether to show the login screen or the app:
+
+```tsx src="frontend/src/AuthContext.tsx" fn="verify"
+```
+
+- The token lives in `localStorage`, wrapped in `try/catch` because storage can be blocked. It survives a refresh, which is why you stay signed in.
+- The client reads the token's `exp` *without verifying it* (`auth.ts`), only to avoid sending a request it knows will be refused. Only the server can verify the signature.
+- `unreachable` is deliberately different from `anonymous`: if the server is down, the user is **not** logged out.
+- On logout the URL hash is cleared, so the next person does not land on the previous person's chat address.
+
+:::warn The localStorage trade-off
+A script running in the page could read the token (cross-site scripting). That is the usual trade-off of this MERN-style approach, and the reason the next section matters so much: model output is rendered without raw HTML or images. An `httpOnly` cookie is the stricter alternative.
+:::
+
+## Attachments in the browser
+
+Files are attached from the paperclip button or by **dragging them onto the chat**. Indexing happens in the background on the server, so the client treats each file as something with a *status*:
+
+```tsx src="frontend/src/Chat.tsx" fn="attach"
+```
+
+The chip next to the composer shows `Indexing` while the file is `processing`, then `Ready` (with the page count) or the safe failure reason. A small effect polls the list while anything is still processing, and stops by itself afterwards:
+
+```tsx src="frontend/src/Chat.tsx" from="// The attached files." to="}, [indexing, refreshDocuments]);"
+```
+
+Details worth noticing:
+
+- **Pure helpers are separate and tested.** `documents.ts` holds the file-type check, the list update and the status text, so they are unit tested without rendering anything.
+- **The client check is only a courtesy.** It saves a round trip for an obviously wrong file; the server re-checks everything (extension, real content, size).
+- **Drag and drop counts.** `dragenter`/`dragleave` fire for every child element, so a counter decides when the "Drop files to attach" overlay disappears; the handler only reacts to real *file* drags, not selected text.
+- **Optimistic removal.** Removing a file hides its chip at once and puts it back if the server refuses.
+
+```ts src="frontend/src/documents.ts" fn="checkFile,upsertDocument"
+```
+
+A reply that used your files shows a **document source card** instead of a link: the file name, the page, and a click-to-expand view of the exact passage the answer relied on. Citation chips for documents are not links (a passage has no address); hovering one names the file and page.
 
 ## Step 5: rendering untrusted output
 
@@ -219,7 +266,9 @@ The equations come in as `\( … \)` and `\[ … \]`, which Markdown treats as e
 - **Optimistic UI** adds your message instantly, then swaps temporary ids for real ones from the `start` event. Beware closures over changing variables.
 - **Stop** is an `AbortController`; unmounting a chat aborts its stream too.
 - Three failures, three responses: **stopped** (keep text), **rejected before start** (roll back, restore your text), **dropped mid-stream** (mark an error, keep text).
-- **Drafts** exist only in the browser until the first message; use a **ref** for values that must change without re-rendering.
+- **Drafts** exist only in the browser until the first message or attachment; use a **ref** for values that must change without re-rendering.
+- **Login** is one wrapper (`authedFetch`) and one state machine; a `401` anywhere signs you out once. The token lives in `localStorage` (a known XSS trade-off).
+- **Attachments** are statuses, not instant: upload returns at once, then the list is **polled** until each file is `ready` or `failed`.
 - Render Markdown **once complete**, and treat the output as **untrusted**: no raw HTML, no images, safe links.
 :::
 
@@ -243,6 +292,12 @@ The output never changes. If a boundary falls between the two newlines, the firs
 + Throws StreamInterrupted, so the UI shows an error instead of presenting a truncated answer as complete.
 - Retries the request.
 > A silent end is never assumed to be success.
+
+? An attached file shows "Indexing". What is the browser doing?
+- Waiting for the model to answer.
++ Polling the document list until the background indexing finishes (ready or failed).
+- Uploading the file again.
+> Upload returns immediately with status "processing"; the work continues on the server.
 
 ? Why is a ref (idRef) used for the new chat's id instead of state?
 - Refs are faster.

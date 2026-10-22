@@ -59,7 +59,7 @@ static instructions  ->  static tool definitions  ->  rolling summary  ->  appen
 Each part earns its place:
 
 - **No timestamps or per-request data in the instructions**, ever.
-- The **tool definitions** are a constant list, identical on every request.
+- The **tool definitions** are a stable list, identical on every request *of a given chat*. One honest wrinkle: the `search_documents` tool is only offered once a chat has a ready attachment, so the list changes **once** (the first request after a file becomes ready) and the cache for that chat misses that time. After that it is stable again. Putting the tools *before* the history is what keeps that a one-off, not a per-message cost.
 - The **summary** only changes when the boundary moves, in *big, rare steps* (the hysteresis from the memory lesson exists partly for this).
 - **History is append-only**: older messages never change, new ones are added at the end.
 
@@ -109,7 +109,7 @@ The saving is **informational**: it is shown ("saved ₹0.04") but never subtrac
 
 ## The Usage page: where the numbers come from
 
-The page answers four questions: *how much did I spend, on what, when, and how much did caching save?* Everything is computed from rows the app already stored; nothing is estimated.
+The page answers four questions: *how much did I spend, on what, when, and how much did caching save?* Everything is computed from rows the app already stored, **for the signed-in user only**; nothing is estimated.
 
 Three sources are combined:
 
@@ -117,7 +117,7 @@ Three sources are combined:
 ```
 
 1. **Reply rows** in `messages` (each carries its own tokens and cost),
-2. **Side calls** in `llm_calls` (titles and summaries),
+2. **Side calls** in `llm_calls` (titles, summaries and document embeddings),
 3. **Archived replies** from deleted chats (so deleting a chat never changes your spend).
 
 Then one function folds them into the report:
@@ -151,7 +151,7 @@ The chart is drawn by hand with HTML and CSS, with no chart library, following a
 | Choice | Reason |
 |---|---|
 | **One colour** for daily spend | it is one series; colour should carry meaning, not decoration |
-| **Spend by purpose** also uses one colour | the categories (replies, titles, summaries) have no natural order, so a colour ramp would invent one |
+| **Spend by purpose** also uses one colour | the categories (replies, titles, summaries, document indexing) have no natural order, so a colour ramp would invent one |
 | Thin columns, 2px gaps, hairline gridlines | the data is the only thing allowed to be loud |
 | Only the **peak** is labelled | a number on every bar is noise; the tooltip carries the rest |
 | A **tooltip on hover *and* keyboard focus**, and a **table view** | nothing is reachable only by hovering |
