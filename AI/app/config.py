@@ -78,6 +78,18 @@ class Settings:
     signup_enabled: bool = True
     auth_rate_limit_per_minute: int = 10  # login/signup attempts per client IP
 
+    # Attachments (per-chat documents) and retrieval.
+    embedding_model: str = "text-embedding-3-small"  # 1536 dimensions: the vector(1536) column depends on it
+    max_upload_mb: int = 10
+    max_documents_per_chat: int = 10
+    upload_rate_limit_per_minute: int = 20  # uploads per user
+    rag_max_pages: int = 300
+    rag_max_chars: int = 2_000_000
+    rag_max_chunks: int = 2000
+    rag_chunk_chars: int = 1800  # about 450 tokens
+    rag_overlap_chars: int = 200
+    rag_top_k: int = 6  # passages handed to the model per search
+
     database_url: str = "postgresql://streambot:streambot@localhost:5440/streambot"
     db_pool_max: int = 10
     prices_path: Path = DATA_DIR / "prices.toml"
@@ -189,6 +201,14 @@ class Settings:
             password_min_length=number("PASSWORD_MIN_LENGTH", 8, integer=True, minimum=8),
             signup_enabled=(text("SIGNUP_ENABLED", "true") or "true").lower() not in ("0", "false", "no", "off"),
             auth_rate_limit_per_minute=number("AUTH_RATE_LIMIT_PER_MINUTE", 10, integer=True),
+            embedding_model=text("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small") or "text-embedding-3-small",
+            max_upload_mb=number("MAX_UPLOAD_MB", 10, integer=True, minimum=1),
+            max_documents_per_chat=number("MAX_DOCUMENTS_PER_CHAT", 10, integer=True, minimum=1),
+            upload_rate_limit_per_minute=number("UPLOAD_RATE_LIMIT_PER_MINUTE", 20, integer=True),
+            rag_max_pages=number("RAG_MAX_PAGES", 300, integer=True, minimum=1),
+            rag_chunk_chars=number("RAG_CHUNK_CHARS", 1800, integer=True, minimum=400),
+            rag_overlap_chars=number("RAG_OVERLAP_CHARS", 200, integer=True, minimum=0),
+            rag_top_k=number("RAG_TOP_K", 6, integer=True, minimum=1),
             database_url=text("DATABASE_URL", "postgresql://streambot:streambot@localhost:5440/streambot") or "",
             db_pool_max=number("DB_POOL_MAX", 10, integer=True, minimum=1),
             prices_path=path("PRICES_PATH", DATA_DIR / "prices.toml"),

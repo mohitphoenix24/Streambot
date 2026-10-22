@@ -54,7 +54,7 @@ def test_info_reports_the_backend_and_model_but_no_secrets(make_client):
     body = make_client().get("/info").json()
     assert body == {"model": "test-model", "usd_to_inr": 88.0,
                     "usd_to_inr_source": "fixed", "usd_to_inr_as_of": None,
-                    "web_search_available": False}
+                    "web_search_available": False, "attachments_available": True}
     hidden = make_client(usd_to_inr=0).get("/info").json()
     assert (hidden["usd_to_inr"], hidden["usd_to_inr_source"]) == (None, "off")  # 0 hides INR
 
@@ -228,6 +228,7 @@ from app.llm.client import Completed, TextDelta, ToolCallFinished, ToolCallStart
 from app.tools.web_search import TavilySearch  # noqa: E402
 
 SRC = {"n": 1, "title": "Python 3.14", "url": "https://python.org/news", "snippet": "released"}
+STORED_SRC = {**SRC, "kind": "web", "page": None, "document_id": None}  # what the API adds when it returns it
 
 
 def search_tool():
@@ -254,7 +255,7 @@ def test_tool_events_stream_in_order_and_sources_are_persisted(make_client):
     assert data["done"]["web_searches"] == 1
 
     reply = client.get(f"/conversations/{cid}").json()["messages"][-1]
-    assert reply["sources"] == [SRC] and reply["web_searches"] == 1 and reply["content"] == "Out now [1]"
+    assert reply["sources"] == [STORED_SRC] and reply["web_searches"] == 1 and reply["content"] == "Out now [1]"
 
 
 def test_sources_are_kept_when_the_reply_fails_afterwards(make_client):
@@ -263,7 +264,7 @@ def test_sources_are_kept_when_the_reply_fails_afterwards(make_client):
     cid = new_conversation(client)
     send(client, cid)
     reply = client.get(f"/conversations/{cid}").json()["messages"][-1]
-    assert reply["status"] == "error" and reply["sources"] == [SRC] and reply["web_searches"] == 1
+    assert reply["status"] == "error" and reply["sources"] == [STORED_SRC] and reply["web_searches"] == 1
 
 
 def test_a_failed_search_is_reported_but_not_counted(make_client):
@@ -404,7 +405,7 @@ def test_usage_endpoint_reports_replies_and_titles(make_client):
     body = client.get("/usage?days=7").json()
     assert body["days"] == 7 and len(body["daily"]) == 7
     assert body["totals"]["replies"] == 1 and body["totals"]["calls"] == 2  # the reply + its title call
-    assert [p["purpose"] for p in body["by_purpose"]] == ["reply", "title", "summary"]
+    assert [p["purpose"] for p in body["by_purpose"]] == ["reply", "title", "summary", "embedding"]
 
 
 @pytest.mark.parametrize("query", ["days=0", "days=400", "utc_offset_minutes=9999", "days=abc"])

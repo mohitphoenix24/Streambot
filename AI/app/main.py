@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
@@ -32,7 +33,11 @@ from app.core.fx import UsdInrProvider
 from app.core.limits import BodySizeLimitMiddleware, SlidingWindowLimiter
 from app.llm.client import LLM, LLMError, build_llm
 from app.llm.pricing import PriceTable
-from app.schemas import ConversationDetail, ConversationOut, MessageOut, SendMessageIn
+from app.rag.embeddings import Embedder, OpenAIEmbedder
+from app.rag.extract import ExtractionError, detect_kind
+from app.rag.ingest import DocumentManager
+from app.schemas import ConversationDetail, ConversationOut, DocumentOut, MessageOut, SendMessageIn
+from app.tools.documents import DocumentSearch
 from app.tools.registry import ToolRunner
 from app.tools.web_search import TavilySearch
 from app.chat.memory import MemoryManager
@@ -44,7 +49,7 @@ log = logging.getLogger("chat.app")
 
 def create_app(
     settings: Settings | None = None, llm: LLM | None = None, fx: UsdInrProvider | None = None,
-    search: TavilySearch | None = None,
+    search: TavilySearch | None = None, embedder: Embedder | None = None,
 ) -> FastAPI:
     """App factory.
 
@@ -56,6 +61,7 @@ def create_app(
     prices = PriceTable.load(settings.prices_path)
     limiter = SlidingWindowLimiter(settings.rate_limit_per_minute)  # chat requests, per USER
     auth_router, current_user = build_auth(settings, db)
+    upload_limiter = SlidingWindowLimiter(settings.upload_rate_limit_per_minute)  # uploads, per USER
     fx = fx or UsdInrProvider(settings.usd_to_inr, settings.usd_to_inr_fallback)
     if search is None and settings.tavily_api_key:
         search = TavilySearch(settings.tavily_api_key, settings.web_search_max_results)
@@ -71,10 +77,15 @@ def create_app(
         settings.validate()
         app.state.llm = llm or build_llm(settings)
         app.state.memory = MemoryManager(db, app.state.llm, prices, settings)
+        app.state.embedder = embedder or OpenAIEmbedder(settings)
+        app.state.documents = DocumentManager(db, app.state.embedder, prices, settings)
         db.init_schema()
         orphaned = db.recover_interrupted()
         if orphaned:
             log.warning("recovered_interrupted_messages count=%d", orphaned)
+        stuck = db.recover_interrupted_documents()
+        if stuck:
+            log.warning("recovered_interrupted_documents count=%d", stuck)
         yield
         db.close()  # return the pooled connections when the server stops
 
@@ -87,7 +98,11 @@ def create_app(
     # responses carry CORS headers (otherwise the browser shows an opaque network
     # error instead of a readable "too large"). Budget per char: JSON can escape a
     # non-BMP character as 12 bytes (two \uXXXX), plus envelope.
-    app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_message_chars * 12 + 1024)
+    app.add_middleware(
+        BodySizeLimitMiddleware,
+        max_bytes=settings.max_message_chars * 12 + 1024,
+        overrides=[(re.compile(r"^/conversations/[^/]+/documents$"), settings.max_upload_mb * 1024 * 1024 + 64 * 1024)],
+    )
 
     # CORS: the React dev server (localhost:3100+) and this API (localhost:8501)
     # are different *origins*, so the browser blocks the page from reading our
@@ -185,6 +200,49 @@ def create_app(
         db.delete_conversation(conversation_id, user["id"])
         return Response(status_code=204)
 
+    # ── Attachments (per-chat documents) ─────────────────────────────────
+    @app.post("/conversations/{conversation_id}/documents", response_model=DocumentOut, status_code=202)
+    async def upload_document(
+        conversation_id: str, request: Request, file: UploadFile = File(...), user: dict = Depends(current_user)
+    ) -> dict:
+        """Accept a file, register it as 'processing' and return at once; indexing continues in the
+        background and the browser polls GET .../documents until it is 'ready' (or 'failed')."""
+        wait = upload_limiter.check(user["id"])
+        if wait is not None:
+            raise HTTPException(status_code=429, detail="Too many uploads. Please wait a moment.",
+                                headers={"Retry-After": str(math.ceil(wait))})
+        require_conversation(conversation_id, user)
+        if len(db.list_documents(conversation_id, user["id"])) >= settings.max_documents_per_chat:
+            raise HTTPException(status_code=409, detail=f"A conversation can have at most {settings.max_documents_per_chat} documents.")
+
+        limit = settings.max_upload_mb * 1024 * 1024
+        data = await file.read(limit + 1)  # never read more than one byte past the limit
+        if len(data) > limit:
+            raise HTTPException(status_code=413, detail=f"File too large (max {settings.max_upload_mb} MB).")
+        filename = re.sub(r"[\x00-\x1f\x7f]", "", (file.filename or "document").replace("\\", "/").split("/")[-1]).strip()[:200] or "document"
+        try:
+            kind = detect_kind(filename, data)
+        except ExtractionError as exc:
+            raise HTTPException(status_code=415, detail=exc.public_message) from exc
+
+        document = db.add_document(user["id"], conversation_id, filename, kind, len(data))
+        request.app.state.documents.schedule(document["id"], user["id"], conversation_id, kind, data)
+        return document
+
+    @app.get("/conversations/{conversation_id}/documents", response_model=list[DocumentOut])
+    async def list_documents(conversation_id: str, user: dict = Depends(current_user)) -> list[dict]:
+        require_conversation(conversation_id, user)
+        return db.list_documents(conversation_id, user["id"])
+
+    @app.delete("/conversations/{conversation_id}/documents/{document_id}", status_code=204)
+    async def delete_document(conversation_id: str, document_id: str, user: dict = Depends(current_user)) -> Response:
+        require_conversation(conversation_id, user)
+        doc = db.get_document(document_id, user["id"])
+        if doc is None or doc["conversation_id"] != conversation_id:
+            raise HTTPException(status_code=404, detail="Document not found")
+        db.delete_document(document_id, user["id"])
+        return Response(status_code=204)
+
     # ── The streaming endpoint (what the React app calls) ────────────────
     #
     # It is a POST (we must send the user's text in a body), and the response is
@@ -198,8 +256,14 @@ def create_app(
         started_at = time.perf_counter()  # t0 for time-to-first-token
         text = prepare_send(user, conversation_id, body)
         turn = begin_turn(db, llm, settings, conversation_id, text)
-        # A fresh runner per reply: it owns the [1], [2], ... citation numbering.
-        tools = ToolRunner(search) if (search is not None and body.web_search) else None
+        # A fresh runner per reply: it owns the [1], [2], ... citation numbering. Web search when the
+        # server has a key and the user left it on; document search when this chat has ready files.
+        web = search if (search is not None and body.web_search) else None
+        documents = (
+            DocumentSearch(db, request.app.state.embedder, prices, settings, user["id"], conversation_id)
+            if db.has_ready_documents(conversation_id, user["id"]) else None
+        )
+        tools = ToolRunner(web, documents) if (web or documents) else None
         return StreamingResponse(
             stream_reply(
                 request=request, db=db, llm=llm, settings=settings, prices=prices,
@@ -272,6 +336,7 @@ def create_app(
             "usd_to_inr_source": rate.source,  # live | fallback | fixed | off
             "usd_to_inr_as_of": rate.as_of,
             "web_search_available": search is not None,
+            "attachments_available": True,
         }
 
     return app

@@ -12,7 +12,7 @@ const RANGES = [7, 30, 90] as const;
  */
 const fit = (text: string, maxPx: number) => ({ "--len": text.length, "--max": `${maxPx}px` }) as CSSProperties;
 
-const PURPOSE_LABEL = { reply: "Replies", title: "Chat titles", summary: "Memory summaries" } as const;
+const PURPOSE_LABEL = { reply: "Replies", title: "Chat titles", summary: "Memory summaries", embedding: "Document indexing" } as const;
 
 /** "$0.0124 · ₹1.17" as two parts so the hero figure can put INR on its own line. */
 function useMoney() {

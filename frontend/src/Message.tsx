@@ -6,7 +6,7 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { formatMoney, formatMs } from "./format";
-import { CheckIcon, ChevronIcon, CopyIcon, GlobeIcon } from "./Icons";
+import { CheckIcon, ChevronIcon, CopyIcon, FileIcon, GlobeIcon } from "./Icons";
 import { normalizeMath } from "./math";
 import { describeRate, useRateInfo, useUsdToInr } from "./rate";
 import { linkCitations } from "./cite";
@@ -22,6 +22,7 @@ export interface ViewMessage extends MessageModel {
 
 export interface ToolStep {
   id: string;
+  name: string; // web_search | search_documents
   query: string | null;
   status: "running" | "done" | "error";
   count?: number;
@@ -136,6 +137,14 @@ function SafeMarkdown({ text, sources }: { text: string; sources: Source[] }) {
         a: ({ node: _node, href, children, ...props }) => {
           // [n] markers were rewritten to #cite-n by linkCitations: show a chip that opens the real source.
           const cited = href?.startsWith("#cite-") ? sources.find((s) => s.n === Number(href.slice(6))) : undefined;
+          if (cited && cited.kind === "document") {
+            // A passage from an attached file has no address to open: the chip names it, the Sources list shows the text.
+            return (
+              <span className="cite cite-doc" title={`${cited.title}${cited.page ? `, page ${cited.page}` : ""}`}>
+                {children}
+              </span>
+            );
+          }
           if (cited) {
             return (
               <a className="cite" href={safeUrl(cited.url)} target="_blank" rel="noopener noreferrer" title={`${cited.title}, ${hostOf(cited.url)}`}>
@@ -164,27 +173,34 @@ const hostOf = (url: string) => {
 /** Only http(s) URLs become links (the server also filters, but the UI doesn't rely on that). */
 const safeUrl = (url: string) => (/^https?:\/\//i.test(url) ? url : undefined);
 
-/** "Searching the web for ..." rows: live while the model works, a summary afterwards. */
+/** "Searching ..." rows: live while the model works, a summary afterwards. */
 function ToolSteps({ steps }: { steps: ToolStep[] }) {
   return (
     <div className="tool-steps" aria-live="polite">
-      {steps.map((t) => (
-        <div key={t.id} className={`tool-step tool-${t.status}`}>
-          <GlobeIcon />
-          {t.status === "running" ? (
-            <span>
-              Searching the web{t.query ? <> for “{t.query}”</> : ""}
-              <i className="dots" />
-            </span>
-          ) : t.status === "error" ? (
-            <span>Search failed: {t.error}</span>
-          ) : (
-            <span>
-              Searched{t.query ? <> “{t.query}”</> : ""} · {t.count} {t.count === 1 ? "source" : "sources"}
-            </span>
-          )}
-        </div>
-      ))}
+      {steps.map((t) => {
+        const docs = t.name === "search_documents";
+        const where = docs ? "your documents" : "the web";
+        const unit = docs ? (t.count === 1 ? "passage" : "passages") : t.count === 1 ? "source" : "sources";
+        return (
+          <div key={t.id} className={`tool-step tool-${t.status}`}>
+            {docs ? <FileIcon /> : <GlobeIcon />}
+            {t.status === "running" ? (
+              <span>
+                Searching {where}
+                {t.query ? <> for “{t.query}”</> : ""}
+                <i className="dots" />
+              </span>
+            ) : t.status === "error" ? (
+              <span>Search failed: {t.error}</span>
+            ) : (
+              <span>
+                Searched {where}
+                {t.query ? <> for “{t.query}”</> : ""} · {t.count} {unit}
+              </span>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -192,6 +208,7 @@ function ToolSteps({ steps }: { steps: ToolStep[] }) {
 function Sources({ sources }: { sources: Source[] }) {
   // Open by default; a long search can collect many sources, so the user can fold them away.
   const [open, setOpen] = useState(true);
+  const [shown, setShown] = useState<number | null>(null); // the document passage whose text is expanded
   return (
     <div className={`sources ${open ? "open" : ""}`}>
       <button type="button" className="sources-toggle" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
@@ -203,12 +220,27 @@ function Sources({ sources }: { sources: Source[] }) {
       {open && (
         <ol>
           {sources.map((s) => (
-            <li key={s.n}>
-              <a href={safeUrl(s.url)} target="_blank" rel="noopener noreferrer" title={s.snippet || s.title}>
-                <span className="src-n">{s.n}</span>
-                <span className="src-title">{s.title}</span>
-                <span className="src-host">{hostOf(s.url)}</span>
-              </a>
+            <li key={s.n} className={s.kind === "document" && shown === s.n ? "expanded" : ""}>
+              {s.kind === "document" ? (
+                <button
+                  type="button"
+                  className="src-card src-doc"
+                  aria-expanded={shown === s.n}
+                  onClick={() => setShown((cur) => (cur === s.n ? null : s.n))}
+                  title="Show the passage the answer used"
+                >
+                  <span className="src-n">{s.n}</span>
+                  <span className="src-title">{s.title}</span>
+                  <span className="src-host">{s.page ? `Page ${s.page}` : "Your document"}</span>
+                  {shown === s.n && <span className="src-snippet">{s.snippet}</span>}
+                </button>
+              ) : (
+                <a className="src-card" href={safeUrl(s.url)} target="_blank" rel="noopener noreferrer" title={s.snippet || s.title}>
+                  <span className="src-n">{s.n}</span>
+                  <span className="src-title">{s.title}</span>
+                  <span className="src-host">{hostOf(s.url)}</span>
+                </a>
+              )}
             </li>
           ))}
         </ol>

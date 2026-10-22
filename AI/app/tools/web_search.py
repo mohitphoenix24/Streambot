@@ -23,9 +23,14 @@ SNIPPET_CHARS = 500  # tokens are money: a snippet is a hint, not the whole page
 
 @dataclass(frozen=True)
 class Source:
+    """Something the answer can cite: a web page, or a passage of one of the user's documents."""
+
     title: str
-    url: str
+    url: str  # empty for a document passage (there is no page to open)
     snippet: str
+    kind: str = "web"  # "web" | "document"
+    page: int | None = None  # PDF page, for a document passage
+    document_id: str | None = None
 
 
 class ToolError(Exception):

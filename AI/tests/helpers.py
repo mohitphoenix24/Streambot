@@ -77,3 +77,88 @@ def parse_sse(text: str) -> list[tuple[str, dict[str, Any]]]:
                 data = json.loads(line[len("data: "):])
         events.append((name, data))
     return events
+
+
+# ── RAG test doubles ─────────────────────────────────────────────────────
+import hashlib  # noqa: E402
+import io  # noqa: E402
+import math  # noqa: E402
+import re  # noqa: E402
+
+from app.rag.embeddings import EMBEDDING_DIMENSIONS, Embedded  # noqa: E402
+
+
+def fake_vector(text: str) -> list[float]:
+    """A deterministic stand-in for an embedding: each word is hashed to one of 1536 slots and the
+    vector is normalised. Texts that SHARE WORDS get a high cosine similarity, which is enough to
+    test retrieval end to end without a network call. (It has no real "meaning", unlike a model.)"""
+    vec = [0.0] * EMBEDDING_DIMENSIONS
+    for word in re.findall(r"[a-z0-9]+", text.lower()):
+        vec[int(hashlib.md5(word.encode()).hexdigest(), 16) % EMBEDDING_DIMENSIONS] += 1.0
+    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+    return [x / norm for x in vec]
+
+
+class FakeEmbedder:
+    model = "fake-embedding"
+
+    def __init__(self, fail_with: Exception | None = None) -> None:
+        self.calls: list[list[str]] = []
+        self.fail_with = fail_with
+
+    async def embed(self, texts: list[str]) -> Embedded:
+        self.calls.append(list(texts))
+        if self.fail_with is not None:
+            raise self.fail_with
+        return Embedded([fake_vector(t) for t in texts], sum(len(t.split()) for t in texts), "fake-snapshot", self.model)
+
+
+def make_pdf(pages: list[str]) -> bytes:
+    """A tiny but VALID PDF with the given text, one string per page (so pypdf reads it like any PDF)."""
+    objects: list[bytes] = []
+    kids = " ".join(f"{3 + 2 * i} 0 R" for i in range(len(pages)))
+    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objects.append(f"<< /Type /Pages /Kids [{kids}] /Count {len(pages)} >>".encode())
+    font_id = 3 + 2 * len(pages)
+    for i, text in enumerate(pages):
+        content_id = 4 + 2 * i
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {content_id} 0 R "
+            f"/Resources << /Font << /F1 {font_id} 0 R >> >> >>".encode()
+        )
+        safe = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        stream = f"BT /F1 12 Tf 50 700 Td ({safe}) Tj ET".encode()
+        objects.append(b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream")
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    out = io.BytesIO()
+    out.write(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(out.tell())
+        out.write(f"{number} 0 obj\n".encode() + body + b"\nendobj\n")
+    xref = out.tell()
+    out.write(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode())
+    for off in offsets:
+        out.write(f"{off:010d} 00000 n \n".encode())
+    out.write(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return out.getvalue()
+
+
+def make_docx(blocks: list[tuple[str, str]], table: list[list[str]] | None = None) -> bytes:
+    """A real .docx. `blocks` are (kind, text): kind is 'h1', 'h2' or 'p'."""
+    from docx import Document
+
+    document = Document()
+    for kind, text in blocks:
+        if kind.startswith("h"):
+            document.add_heading(text, level=int(kind[1:]))
+        else:
+            document.add_paragraph(text)
+    if table:
+        t = document.add_table(rows=len(table), cols=len(table[0]))
+        for r, row in enumerate(table):
+            for c, cell in enumerate(row):
+                t.cell(r, c).text = cell
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()

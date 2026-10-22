@@ -2,12 +2,33 @@
 
 export type MessageStatus = "streaming" | "complete" | "cancelled" | "error";
 
-/** A web page the model searched up; the reply cites it as [n]. */
+/** What the reply cites as [n]: a web page, or a passage from a document attached to the chat. */
 export interface Source {
   n: number;
   title: string;
+  /** Web page address. Empty for a document passage. */
   url: string;
+  /** Web: the search snippet. Document: the passage itself. */
   snippet: string;
+  kind: "web" | "document";
+  /** PDF page of a document passage, when the format has pages. */
+  page: number | null;
+  document_id: string | null;
+}
+
+/** A file attached to a chat. It is indexed in the background: processing -> ready (or failed). */
+export interface DocumentInfo {
+  id: string;
+  conversation_id: string;
+  filename: string;
+  kind: "pdf" | "docx" | "text" | "markdown";
+  size_bytes: number;
+  status: "processing" | "ready" | "failed";
+  /** A safe, short reason when status is "failed". */
+  error: string | null;
+  page_count: number | null;
+  chunk_count: number;
+  created_at: string;
 }
 
 export interface Message {
@@ -147,7 +168,7 @@ export interface UsageReport {
     web_searches: number;
   };
   cache: { hit_rate: number | null; cached_input_tokens: number; savings_usd: number | null };
-  by_purpose: { purpose: "reply" | "title" | "summary"; calls: number; cost_usd: number; total_tokens: number }[];
+  by_purpose: { purpose: "reply" | "title" | "summary" | "embedding"; calls: number; cost_usd: number; total_tokens: number }[];
   by_model: { model: string; calls: number; cost_usd: number; total_tokens: number }[];
   daily: { date: string; cost_usd: number; total_tokens: number; replies: number }[];
   top_conversations: { id: string; title: string; cost_usd: number; replies: number }[];

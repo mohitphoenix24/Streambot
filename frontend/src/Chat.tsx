@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, createConversation, getConversation, streamMessage } from "./api";
+import { ApiError, createConversation, deleteDocument, getConversation, listDocuments, streamMessage, uploadDocument } from "./api";
+import { ACCEPT, anyProcessing, checkFile, describeDocument, hasFiles, upsertDocument } from "./documents";
 import { formatMoney } from "./format";
-import { describeRate, useRateInfo, useUsdToInr, useWebSearchAvailable } from "./rate";
-import { ArrowDownIcon, GlobeIcon, LogoMark, SendIcon, StopIcon } from "./Icons";
+import { describeRate, useAttachmentsAvailable, useRateInfo, useUsdToInr, useWebSearchAvailable } from "./rate";
+import { ArrowDownIcon, CloseIcon, FileIcon, GlobeIcon, LogoMark, PaperclipIcon, SendIcon, StopIcon } from "./Icons";
 import Message, { type ViewMessage } from "./Message";
-import type { Conversation } from "./types";
+import type { Conversation, DocumentInfo } from "./types";
 
 interface Props {
   /** null = a fresh draft chat: nothing exists on the server until the first message is sent. */
@@ -64,6 +65,7 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
   const rate = useUsdToInr();
   const rateInfo = useRateInfo();
   const searchAvailable = useWebSearchAvailable();
+  const attachmentsAvailable = useAttachmentsAvailable();
   const [webSearch, setWebSearch] = useState(readSearchPref);
   const [messages, setMessages] = useState<ViewMessage[]>([]);
   const [title, setTitle] = useState("");
@@ -75,6 +77,9 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
   const [historySummarized, setHistorySummarized] = useState(false);
   const [input, setInput] = useState("");
   const [showJump, setShowJump] = useState(false); // "jump to latest" while scrolled up
+  const [documents, setDocuments] = useState<DocumentInfo[]>([]); // files attached to this chat
+  const [uploading, setUploading] = useState<string[]>([]); // names being sent to the server right now
+  const [dragging, setDragging] = useState(false); // a file is being dragged over the chat
 
   // The AbortController of the request in flight (null when idle). Calling
   // .abort() makes the browser close the connection; see Stop below.
@@ -86,6 +91,8 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
   const bottomRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const dragDepth = useRef(0); // dragenter/leave fire for every child element: count them
 
   // Load the conversation from the server. The DATABASE is the source of
   // truth, which is why a page refresh brings everything back.
@@ -128,6 +135,30 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
     if (stickToBottom.current) bottomRef.current?.scrollIntoView({ block: "end" });
   }, [messages]);
 
+  // The attached files. Indexing happens in the background on the server, so while any file is
+  // still "processing" we ask again every 1.5 s; the chip flips to "ready" (or "failed") by itself.
+  const refreshDocuments = useCallback(async () => {
+    const id = idRef.current;
+    if (!id) return;
+    try {
+      const list = await listDocuments(id);
+      if (mountedRef.current) setDocuments(list);
+    } catch {
+      /* a missed poll is harmless: the next one tries again */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (attachmentsAvailable) void refreshDocuments();
+  }, [attachmentsAvailable, refreshDocuments]);
+
+  const indexing = anyProcessing(documents);
+  useEffect(() => {
+    if (!indexing) return;
+    const timer = window.setInterval(() => void refreshDocuments(), 1500);
+    return () => window.clearInterval(timer);
+  }, [indexing, refreshDocuments]);
+
   // Grow the composer with its content (up to the CSS max-height), shrink it back after sending.
   useEffect(() => {
     const el = textareaRef.current;
@@ -154,24 +185,94 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
     bottomRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
   }
 
+  const failure = (err: unknown) =>
+    err instanceof ApiError ? err.message : "Could not reach the server. Is the backend running?";
+
+  /** The id of this chat, creating it first if it is still a draft. null = the server refused (banner shown). */
+  async function ensureConversation(): Promise<string | null> {
+    if (idRef.current) return idRef.current;
+    // First message (or first attachment) of a draft chat: save the conversation now, so abandoned
+    // "New chat" tabs never leave empty conversations behind.
+    try {
+      const conv = await createConversation();
+      idRef.current = conv.id;
+      onCreated(conv);
+      return conv.id;
+    } catch (err) {
+      setBanner(failure(err));
+      return null;
+    }
+  }
+
+  async function attach(files: File[]) {
+    if (!attachmentsAvailable || files.length === 0) return;
+    setBanner(null);
+    const accepted = files.filter((f) => {
+      const problem = checkFile(f.name);
+      if (problem) setBanner(problem);
+      return !problem;
+    });
+    if (accepted.length === 0) return;
+    const convId = await ensureConversation();
+    if (!convId) return;
+    // One at a time: simple, and the server limits uploads per minute anyway.
+    for (const file of accepted) {
+      setUploading((u) => [...u, file.name]);
+      try {
+        const doc = await uploadDocument(convId, file);
+        if (mountedRef.current) setDocuments((docs) => upsertDocument(docs, doc));
+      } catch (err) {
+        if (mountedRef.current) setBanner(failure(err));
+      } finally {
+        if (mountedRef.current) {
+          setUploading((u) => {
+            const at = u.indexOf(file.name); // drop one entry, so two files with the same name still count separately
+            return at < 0 ? u : [...u.slice(0, at), ...u.slice(at + 1)];
+          });
+        }
+      }
+    }
+  }
+
+  async function removeDocument(doc: DocumentInfo) {
+    const before = documents;
+    setDocuments((docs) => docs.filter((d) => d.id !== doc.id)); // optimistic; put it back if the server says no
+    try {
+      await deleteDocument(doc.conversation_id, doc.id);
+    } catch (err) {
+      setDocuments(before);
+      setBanner(failure(err));
+    }
+  }
+
+  function onDragEnter(e: React.DragEvent) {
+    if (!attachmentsAvailable || !hasFiles(e.dataTransfer?.types)) return;
+    e.preventDefault();
+    dragDepth.current += 1;
+    setDragging(true);
+  }
+  function onDragOver(e: React.DragEvent) {
+    if (attachmentsAvailable && hasFiles(e.dataTransfer?.types)) e.preventDefault(); // required, or the browser refuses the drop
+  }
+  function onDragLeave() {
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragging(false);
+  }
+  function onDrop(e: React.DragEvent) {
+    if (!attachmentsAvailable || !hasFiles(e.dataTransfer?.types)) return;
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDragging(false);
+    void attach(Array.from(e.dataTransfer.files));
+  }
+
   async function send() {
     const text = input.trim();
     if (!text || streaming) return;
 
     setBanner(null);
-    if (!idRef.current) {
-      // First message of a draft chat: save the conversation now, so abandoned
-      // "New chat" tabs never leave empty conversations behind.
-      try {
-        const conv = await createConversation();
-        idRef.current = conv.id;
-        onCreated(conv);
-      } catch (err) {
-        setBanner(err instanceof ApiError ? err.message : "Could not reach the server. Is the backend running?");
-        return;
-      }
-    }
-    const convId = idRef.current as string; // set above for a draft
+    const convId = await ensureConversation();
+    if (!convId) return;
     setHistoryTruncated(false);
     setHistorySummarized(false);
     stickToBottom.current = true;
@@ -226,7 +327,7 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
           // The model decided to search: show it live ("Searching the web for ...").
           onToolCall: (e) =>
             patchAssistant((m) => ({
-              toolSteps: [...(m.toolSteps ?? []), { id: e.id, query: e.query, status: "running" as const }],
+              toolSteps: [...(m.toolSteps ?? []), { id: e.id, name: e.name, query: e.query, status: "running" as const }],
             })),
           // The search came back: remember its sources (the answer will cite them as [n]).
           onToolResult: (e) =>
@@ -326,7 +427,14 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
         : formatMoney(totals.cost, rate);
 
   return (
-    <section className="chat">
+    <section className="chat" onDragEnter={onDragEnter} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}>
+      {dragging && (
+        <div className="drop-overlay" aria-hidden>
+          <PaperclipIcon width={28} height={28} />
+          <strong>Drop files to attach</strong>
+          <span>PDF, Word (.docx), text or Markdown. The assistant can search them in this chat.</span>
+        </div>
+      )}
       <header className="chat-header">
         <h2>{title || "New chat"}</h2>
         {totals.tokens > 0 && (
@@ -366,7 +474,10 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
             <div className="empty">
               <LogoMark width={48} height={48} />
               <h3>How can I help today?</h3>
-              <p>Ask anything. Replies stream in as they are generated.</p>
+              <p>
+                Ask anything. Replies stream in as they are generated
+                {attachmentsAvailable ? ", or attach a document and ask about it." : "."}
+              </p>
               <div className="suggestions">
                 {SUGGESTIONS.map((q) => (
                   <button
@@ -422,7 +533,55 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
           void send();
         }}
       >
+        {(documents.length > 0 || uploading.length > 0) && (
+          <ul className="attachments" aria-label="Attached files">
+            {documents.map((d) => (
+              <li key={d.id} className={`attachment attachment-${d.status}`} title={describeDocument(d)}>
+                <FileIcon />
+                <span className="attachment-name">{d.filename}</span>
+                <span className="attachment-state">
+                  {d.status === "processing" ? "Indexing" : d.status === "failed" ? (d.error ?? "Failed") : d.page_count ? `${d.page_count} p` : "Ready"}
+                </span>
+                <button type="button" className="attachment-remove" onClick={() => void removeDocument(d)} aria-label={`Remove ${d.filename}`} title="Remove">
+                  <CloseIcon />
+                </button>
+              </li>
+            ))}
+            {uploading.map((name, i) => (
+              <li key={`up-${i}-${name}`} className="attachment attachment-processing" title={`Uploading ${name}…`}>
+                <FileIcon />
+                <span className="attachment-name">{name}</span>
+                <span className="attachment-state">Uploading</span>
+              </li>
+            ))}
+          </ul>
+        )}
         <div className="composer-box">
+          {attachmentsAvailable && (
+            <>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept={ACCEPT}
+                multiple
+                hidden
+                onChange={(e) => {
+                  void attach(Array.from(e.target.files ?? []));
+                  e.target.value = ""; // so choosing the same file again still fires onChange
+                }}
+              />
+              <button
+                type="button"
+                className="attach-btn"
+                title="Attach PDF, Word, text or Markdown files. The assistant can search them in this chat."
+                aria-label="Attach files"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={load !== "ready"}
+              >
+                <PaperclipIcon />
+              </button>
+            </>
+          )}
           <textarea
             ref={textareaRef}
             value={input}

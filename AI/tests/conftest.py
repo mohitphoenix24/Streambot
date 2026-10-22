@@ -12,7 +12,7 @@ from app.auth.passwords import hash_password
 from app.auth.tokens import create_token
 from app.config import Settings
 from app.db import Database
-from tests.helpers import ScriptedLLM, ok_script
+from tests.helpers import FakeEmbedder, ScriptedLLM, ok_script
 
 
 @pytest.fixture(autouse=True)
@@ -118,9 +118,9 @@ def settings(tmp_path, database_url):
 def make_client(settings):
     clients = []
 
-    def _make(llm=None, search=None, **overrides):
+    def _make(llm=None, search=None, embedder=None, **overrides):
         s = Settings(**{**settings.__dict__, **overrides})
-        app = create_app(s, llm or ScriptedLLM(ok_script("hi")), search=search)
+        app = create_app(s, llm or ScriptedLLM(ok_script("hi")), search=search, embedder=embedder or FakeEmbedder())
         client = TestClient(app)
         client.__enter__()  # runs lifespan: schema creation + crash recovery
         clients.append(client)

@@ -12,6 +12,7 @@ rate-limit store such as Redis, a gateway/WAF, spend alerts).
 """
 from __future__ import annotations
 
+import re
 import time
 from collections import deque
 from typing import Callable
@@ -31,14 +32,18 @@ class BodySizeLimitMiddleware:
     at the reverse proxy (e.g. nginx client_max_body_size).
     """
 
-    def __init__(self, app, max_bytes: int) -> None:
+    def __init__(self, app, max_bytes: int, overrides: list[tuple[re.Pattern, int]] | None = None) -> None:
         self.app = app
         self.max_bytes = max_bytes
+        # (path pattern, bigger limit): a file upload route legitimately carries megabytes, a chat
+        # message never does, so only the upload route gets the larger cap.
+        self.overrides = overrides or []
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] == "http":
+            limit = next((cap for pattern, cap in self.overrides if pattern.match(scope.get("path", ""))), self.max_bytes)
             for name, value in scope["headers"]:
-                if name == b"content-length" and value.isdigit() and int(value) > self.max_bytes:
+                if name == b"content-length" and value.isdigit() and int(value) > limit:
                     response = JSONResponse({"detail": "Request body too large"}, status_code=413)
                     await response(scope, receive, send)
                     return

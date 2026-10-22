@@ -94,6 +94,23 @@ export const TrashIcon = (p: P) => (
   </svg>
 );
 
+export const PaperclipIcon = (p: P) => (
+  <svg {...base} {...p}>
+    <path d="M20.5 11.5l-8.2 8.2a5 5 0 0 1-7.1-7.1l8.9-8.9a3.3 3.3 0 0 1 4.7 4.7l-8.9 8.9a1.7 1.7 0 0 1-2.4-2.4l8.2-8.2" />
+  </svg>
+);
+export const FileIcon = (p: P) => (
+  <svg {...base} {...p}>
+    <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+    <path d="M14 3v5h5M9 13h6M9 17h4" />
+  </svg>
+);
+export const CloseIcon = (p: P) => (
+  <svg {...base} {...p}>
+    <path d="M6 6l12 12M18 6L6 18" />
+  </svg>
+);
+
 /** Brand mark: a prompt chevron followed by a streaming cursor. */
 export const LogoMark = (p: P) => (
   <svg width={28} height={28} viewBox="0 0 32 32" fill="none" aria-hidden {...p}>

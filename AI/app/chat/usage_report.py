@@ -17,7 +17,7 @@ from typing import Any
 from app.db import Database
 from app.llm.pricing import PriceTable
 
-PURPOSES = ("reply", "title", "summary")
+PURPOSES = ("reply", "title", "summary", "embedding")
 
 
 def _parse(created_at: str) -> datetime:

@@ -22,8 +22,24 @@ class SendMessageIn(BaseModel):
 class SourceOut(BaseModel):
     n: int  # the [n] the reply uses to cite it
     title: str
-    url: str
+    url: str  # empty for a passage of an uploaded document
     snippet: str = ""
+    kind: str = "web"  # "web" | "document"
+    page: int | None = None  # PDF page, for a document passage
+    document_id: str | None = None
+
+
+class DocumentOut(BaseModel):
+    id: str
+    conversation_id: str
+    filename: str
+    kind: str  # pdf | docx | text | markdown
+    size_bytes: int
+    status: str  # processing | ready | failed
+    error: str | None = None  # a safe reason when status is "failed"
+    page_count: int | None = None
+    chunk_count: int = 0
+    created_at: str
 
 
 class MessageOut(BaseModel):

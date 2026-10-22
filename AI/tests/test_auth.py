@@ -254,7 +254,7 @@ def test_pre_login_data_is_kept_under_a_legacy_account(tmp_path):
             conn.execute("INSERT INTO conversations (id, title, created_at, updated_at) VALUES ('c1', 'old chat', now(), now())")
             conn.execute("INSERT INTO llm_calls (id, conversation_id, purpose, model, created_at) VALUES ('l1', 'c1', 'title', 'm', now())")
 
-        assert migrate(old) == ["002_users"]  # now upgrade to the current schema
+        assert migrate(old)[0] == "002_users"  # now upgrade to the current schema (later migrations follow)
 
         with old.connect() as conn:
             assert conn.execute("SELECT user_id FROM conversations WHERE id = 'c1'").fetchone()["user_id"] == "legacy"

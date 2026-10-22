@@ -3,6 +3,7 @@ import type {
   Conversation,
   ConversationDetail,
   DeltaEvent,
+  DocumentInfo,
   DoneEvent,
   ErrorEvent,
   StartEvent,
@@ -96,8 +97,24 @@ export interface Info {
   usd_to_inr_source: "live" | "fallback" | "fixed" | "off";
   usd_to_inr_as_of: string | null;
   web_search_available: boolean;
+  attachments_available: boolean;
 }
 export const getInfo = () => json<Info>("/info");
+
+// ── per-chat attachments ────────────────────────────────────────────────
+export const listDocuments = (conversationId: string) => json<DocumentInfo[]>(`/conversations/${conversationId}/documents`);
+/** Upload one file. Returns at once with status "processing"; poll listDocuments until it is ready. */
+export function uploadDocument(conversationId: string, file: File): Promise<DocumentInfo> {
+  const body = new FormData();
+  body.append("file", file);
+  // No Content-Type header: the browser must set it itself, because it includes the multipart boundary.
+  return json<DocumentInfo>(`/conversations/${conversationId}/documents`, { method: "POST", body });
+}
+export async function deleteDocument(conversationId: string, documentId: string): Promise<void> {
+  const res = await authedFetch(`/conversations/${conversationId}/documents/${documentId}`, { method: "DELETE" });
+  if (!res.ok) throw await readError(res);
+}
+
 /** `utcOffsetMinutes` (east positive) makes the backend bucket days on the user's clock. */
 export const getUsage = (days: number, utcOffsetMinutes: number) =>
   json<UsageReport>(`/usage?days=${days}&utc_offset_minutes=${utcOffsetMinutes}`);

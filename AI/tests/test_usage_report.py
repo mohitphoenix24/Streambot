@@ -36,7 +36,7 @@ def test_empty_database_gives_zeros_and_nulls_not_made_up_numbers(db, uid):
     r = report(db, uid)
     assert r["totals"]["cost_usd"] == 0 and r["totals"]["calls"] == 0
     assert r["cache"] == {"hit_rate": None, "cached_input_tokens": 0, "savings_usd": 0.0}
-    assert r["top_conversations"] == [] and [p["calls"] for p in r["by_purpose"]] == [0, 0, 0]
+    assert r["top_conversations"] == [] and [p["calls"] for p in r["by_purpose"]] == [0, 0, 0, 0]
     assert len(r["daily"]) == 7 and r["daily"][-1]["date"] == "2026-10-22" and r["daily"][0]["date"] == "2026-10-16"
 
 

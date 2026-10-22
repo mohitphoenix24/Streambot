@@ -77,6 +77,11 @@ def _new_id() -> str:
     return uuid.uuid4().hex
 
 
+def vector_literal(vector: list[float]) -> str:
+    """A Python list as pgvector's text form, '[0.1,0.2,...]' (cast with ::vector in SQL)."""
+    return "[" + ",".join(f"{x:.7g}" for x in vector) + "]"
+
+
 def _clean(row: dict[str, Any] | None) -> dict[str, Any] | None:
     """A row as the rest of the app sees it: timestamps as ISO-8601 strings (the API's format)."""
     if row is None:
@@ -295,6 +300,123 @@ class Database:
     def touch_conversation(self, conversation_id: str) -> None:
         with self.connect() as conn:
             conn.execute("UPDATE conversations SET updated_at = %s WHERE id = %s", (_now(), conversation_id))
+
+    # ── documents and chunks (attachments / RAG) ─────────────────────────
+    def add_document(self, user_id: str, conversation_id: str, filename: str, kind: str, size_bytes: int) -> dict[str, Any]:
+        """Register an upload. It starts as 'processing'; a background task makes it 'ready' or 'failed'."""
+        doc = {"id": _new_id(), "user_id": user_id, "conversation_id": conversation_id, "filename": filename,
+               "kind": kind, "size_bytes": size_bytes, "created_at": _now()}
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO documents (id, user_id, conversation_id, filename, kind, size_bytes, status, created_at) "
+                "VALUES (%(id)s, %(user_id)s, %(conversation_id)s, %(filename)s, %(kind)s, %(size_bytes)s, 'processing', %(created_at)s)",
+                doc,
+            )
+        return self.get_document(doc["id"], user_id)  # type: ignore[return-value]
+
+    _DOCUMENT_COLUMNS = "id, conversation_id, filename, kind, size_bytes, status, error, page_count, chunk_count, created_at"
+
+    def get_document(self, document_id: str, user_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT {self._DOCUMENT_COLUMNS} FROM documents WHERE id = %s AND user_id = %s", (document_id, user_id)
+            ).fetchone()
+        return _clean(row)
+
+    def list_documents(self, conversation_id: str, user_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT {self._DOCUMENT_COLUMNS} FROM documents WHERE conversation_id = %s AND user_id = %s ORDER BY created_at, id",
+                (conversation_id, user_id),
+            ).fetchall()
+        return [_clean(r) for r in rows]  # type: ignore[misc]
+
+    def delete_document(self, document_id: str, user_id: str) -> bool:
+        with self.connect() as conn:  # its chunks go with it (ON DELETE CASCADE)
+            cur = conn.execute("DELETE FROM documents WHERE id = %s AND user_id = %s", (document_id, user_id))
+        return cur.rowcount > 0
+
+    def has_ready_documents(self, conversation_id: str, user_id: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 AS found FROM documents WHERE conversation_id = %s AND user_id = %s AND status = 'ready' LIMIT 1",
+                (conversation_id, user_id),
+            ).fetchone()
+        return row is not None
+
+    def mark_document_failed(self, document_id: str, error: str) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE documents SET status = 'failed', error = %s WHERE id = %s", (error, document_id))
+
+    def complete_document(self, document_id: str, page_count: int | None, chunks: list[dict[str, Any]]) -> None:
+        """Store a document's chunks (with their vectors) and mark it ready, in ONE transaction:
+        a document is never 'ready' with only some of its chunks."""
+        with self.connect() as conn:
+            conn.execute("DELETE FROM chunks WHERE document_id = %s", (document_id,))
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO chunks (document_id, user_id, conversation_id, ordinal, page, heading, content, tokens, embedding) "
+                    "VALUES (%(document_id)s, %(user_id)s, %(conversation_id)s, %(ordinal)s, %(page)s, %(heading)s, "
+                    "        %(content)s, %(tokens)s, %(embedding)s::vector)",
+                    [{**c, "document_id": document_id, "embedding": vector_literal(c["embedding"])} for c in chunks],
+                )
+            conn.execute(
+                "UPDATE documents SET status = 'ready', error = NULL, page_count = %s, chunk_count = %s WHERE id = %s",
+                (page_count, len(chunks), document_id),
+            )
+
+    def recover_interrupted_documents(self) -> int:
+        """A server killed mid-upload leaves documents 'processing' for ever. At startup none can be live."""
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE documents SET status = 'failed', error = 'Processing was interrupted. Please upload it again.' "
+                "WHERE status = 'processing'"
+            )
+            return cur.rowcount
+
+    def search_chunks(
+        self, user_id: str, conversation_id: str, query_vector: list[float], query_text: str,
+        candidates: int = 20, limit: int = 6,
+    ) -> list[dict[str, Any]]:
+        """HYBRID search over one user's one chat: meaning (vector) + keywords (full text), merged.
+
+        Each method ranks its own top `candidates`; the two rankings are combined with
+        Reciprocal Rank Fusion (RRF): a chunk scores 1/(60 + rank) from each list it appears in, so
+        a passage that BOTH methods like beats one that only one likes. It needs no tuning, because
+        it uses ranks, not the (incomparable) raw scores.
+        """
+        params = {"u": user_id, "c": conversation_id, "q": vector_literal(query_vector), "t": query_text,
+                  "k": candidates, "n": limit}
+        with self.connect() as conn:
+            # The filter (one chat) is very selective, so let the HNSW index keep scanning until it
+            # has enough matching rows instead of giving up early with too few results.
+            conn.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+            rows = conn.execute(
+                """
+                WITH vec AS (
+                    SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> %(q)s::vector) AS rank
+                    FROM chunks WHERE user_id = %(u)s AND conversation_id = %(c)s
+                    ORDER BY embedding <=> %(q)s::vector LIMIT %(k)s
+                ), kw AS (
+                    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, query) DESC) AS rank
+                    FROM chunks, websearch_to_tsquery('english', %(t)s) AS query
+                    WHERE user_id = %(u)s AND conversation_id = %(c)s AND tsv @@ query
+                    ORDER BY ts_rank_cd(tsv, query) DESC LIMIT %(k)s
+                )
+                SELECT c.id, c.document_id, d.filename, c.page, c.heading, c.content,
+                       vec.rank AS vector_rank, kw.rank AS keyword_rank,
+                       (COALESCE(1.0 / (60 + vec.rank), 0) + COALESCE(1.0 / (60 + kw.rank), 0))::float8 AS score
+                FROM (SELECT id FROM vec UNION SELECT id FROM kw) hits
+                JOIN chunks c ON c.id = hits.id
+                JOIN documents d ON d.id = c.document_id
+                LEFT JOIN vec ON vec.id = c.id
+                LEFT JOIN kw ON kw.id = c.id
+                ORDER BY score DESC, c.id
+                LIMIT %(n)s
+                """,
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ── messages ─────────────────────────────────────────────────────────
     def add_message(

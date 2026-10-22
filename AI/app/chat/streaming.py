@@ -232,7 +232,7 @@ async def stream_reply(
                 elif isinstance(event, ToolCallStarted):
                     yield sse("tool_call", {"id": event.call_id, "name": event.name, "query": event.query})
                 elif isinstance(event, ToolCallFinished):
-                    if not event.error:
+                    if not event.error and event.name == "web_search":  # searching the user's own files is not a web search
                         web_searches += 1
                     sources.extend(event.sources)
                     # Checkpoint right away so a crash keeps what the answer will cite.

@@ -945,7 +945,7 @@ a.cite:hover {
   list-style: none;
 }
 
-.sources a {
+.src-card {
   display: grid;
   grid-template-columns: auto 1fr;
   column-gap: 10px;
@@ -960,7 +960,15 @@ a.cite:hover {
   transition: border-color 0.15s, background 0.15s;
 }
 
-.sources a:hover {
+/* a document passage is a button (it expands to show the text), not a link */
+button.src-card {
+  width: 100%;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.src-card:hover {
   border-color: var(--accent-line);
   background: var(--accent-soft);
 }
@@ -992,6 +1000,182 @@ a.cite:hover {
   white-space: nowrap;
   font: 11.5px var(--mono);
   color: var(--faint);
+}
+
+/* document passages: expandable source cards and the citation chip */
+.sources li.expanded {
+  grid-column: 1 / -1;
+}
+
+.src-snippet {
+  grid-column: 1 / -1;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+span.cite-doc {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  margin: 0 2px;
+  vertical-align: 0.15em;
+  border: 1px solid var(--accent-line);
+  border-radius: 9px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font: 600 11px var(--mono);
+  cursor: help;
+}
+
+/* ── attachments: chips above the composer, attach button, drop target ─── */
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 760px;
+  margin: 0 auto 8px;
+  padding: 0;
+  list-style: none;
+}
+
+.attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 4px 6px 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.attachment svg {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+}
+
+.attachment-name {
+  overflow: hidden;
+  max-width: 220px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.attachment-state {
+  overflow: hidden;
+  max-width: 200px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 11px var(--mono);
+  color: var(--faint);
+}
+
+.attachment-ready {
+  border-color: var(--accent-line);
+}
+
+.attachment-ready svg,
+.attachment-ready .attachment-state {
+  color: var(--accent-strong);
+}
+
+.attachment-processing .attachment-state {
+  color: var(--accent-strong);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.attachment-failed {
+  border-color: rgba(255, 90, 90, 0.3);
+  background: var(--danger-bg);
+}
+
+.attachment-failed svg,
+.attachment-failed .attachment-state {
+  color: var(--danger);
+}
+
+.attachment-remove {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+  color: var(--faint);
+  cursor: pointer;
+}
+
+.attachment-remove svg {
+  width: 12px;
+  height: 12px;
+}
+
+.attachment-remove:hover {
+  background: var(--raised);
+  color: var(--text);
+}
+
+.attach-btn {
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  margin-left: -8px;
+  background: transparent;
+  border: 0;
+  border-radius: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+
+.attach-btn:hover:not(:disabled) {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+}
+
+.attach-btn:disabled {
+  color: var(--faint);
+  cursor: not-allowed;
+}
+
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 12px;
+  border: 2px dashed var(--accent-line);
+  border-radius: 18px;
+  background: rgba(7, 11, 15, 0.86);
+  color: var(--accent-strong);
+  text-align: center;
+  pointer-events: none; /* the section underneath still receives the drop */
+}
+
+.drop-overlay span {
+  color: var(--muted);
+  font-size: 13px;
 }
 
 /* composer: web search toggle */
