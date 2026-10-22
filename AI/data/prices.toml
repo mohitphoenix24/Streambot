@@ -1,0 +1,44 @@
+# Model prices used to turn token usage into dollars.
+#
+# YOU fill this in. This file intentionally contains NO real OpenAI prices:
+# they change and differ per model/account, and guessing would put wrong numbers
+# in your UI. Look up the current price for the model you set in OPENAI_MODEL on
+# OpenAI's pricing page and add an entry.
+#
+# Units: USD per ONE MILLION tokens.
+#
+#   non_cached_input = input_tokens - cached_input_tokens
+#   cost = non_cached_input  * input        / 1_000_000
+#        + cached_input      * cached_input / 1_000_000
+#        + output_tokens     * output       / 1_000_000   (output includes reasoning tokens)
+#
+# `cached_input` is OPTIONAL. If a model reports cached tokens but has no
+# `cached_input` price here, its cost is left unknown instead of guessed.
+#
+# The key must match OPENAI_MODEL (or OPENAI_TITLE_MODEL) EXACTLY.
+#
+# If a model has no entry here, its cost is shown as "cost n/a" (stored as NULL),
+# never as $0.
+#
+# Template (uncomment and edit):
+#
+# [models."your-model-id"]
+# input        = 0.00   # USD per 1M (non-cached) input tokens
+# cached_input = 0.00   # USD per 1M cached input tokens (optional)
+# output       = 0.00   # USD per 1M output tokens
+
+# Prices below were supplied by the project owner (2026-10-06), copied from
+# pricing text they pasted; the app does NOT verify them. Re-check OpenAI's
+# pricing page before relying on them.
+
+# gpt-5.4-mini
+[models."gpt-5.4-mini"]
+input        = 0.75
+cached_input = 0.075
+output       = 4.50
+
+# gpt-5.6-luna (the model this project is configured to use)
+[models."gpt-5.6-luna"]
+input        = 0.20
+cached_input = 0.02
+output       = 1.20

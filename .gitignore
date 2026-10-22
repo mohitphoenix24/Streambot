@@ -1,0 +1,26 @@
+# Secrets — the OpenAI key lives ONLY here, never in git, never in the browser.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# SQLite database files (conversations are user data, not source code)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Node
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
