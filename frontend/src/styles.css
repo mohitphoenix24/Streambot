@@ -890,12 +890,50 @@ a.cite:hover {
   margin-top: 14px;
 }
 
-.sources-title {
-  margin-bottom: 8px;
+.sources-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 8px -4px;
+  padding: 3px 8px 3px 4px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--faint);
   font: 500 10.5px var(--mono);
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--faint);
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s;
+}
+
+.sources-toggle:hover {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+}
+
+.sources-toggle svg {
+  width: 14px;
+  height: 14px;
+  transform: rotate(-90deg);
+  transition: transform 0.18s var(--ease);
+}
+
+.sources.open .sources-toggle svg {
+  transform: none;
+}
+
+.sources-toggle b {
+  margin-left: 4px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.sources:not(.open) .sources-toggle {
+  margin-bottom: 0;
 }
 
 .sources ol {

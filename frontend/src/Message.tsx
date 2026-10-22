@@ -6,7 +6,7 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { formatMoney, formatMs } from "./format";
-import { CheckIcon, CopyIcon, GlobeIcon } from "./Icons";
+import { CheckIcon, ChevronIcon, CopyIcon, GlobeIcon } from "./Icons";
 import { normalizeMath } from "./math";
 import { describeRate, useRateInfo, useUsdToInr } from "./rate";
 import { linkCitations } from "./cite";
@@ -190,20 +190,29 @@ function ToolSteps({ steps }: { steps: ToolStep[] }) {
 }
 
 function Sources({ sources }: { sources: Source[] }) {
+  // Open by default; a long search can collect many sources, so the user can fold them away.
+  const [open, setOpen] = useState(true);
   return (
-    <div className="sources">
-      <div className="sources-title">Sources</div>
-      <ol>
-        {sources.map((s) => (
-          <li key={s.n}>
-            <a href={safeUrl(s.url)} target="_blank" rel="noopener noreferrer" title={s.snippet || s.title}>
-              <span className="src-n">{s.n}</span>
-              <span className="src-title">{s.title}</span>
-              <span className="src-host">{hostOf(s.url)}</span>
-            </a>
-          </li>
-        ))}
-      </ol>
+    <div className={`sources ${open ? "open" : ""}`}>
+      <button type="button" className="sources-toggle" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+        <ChevronIcon />
+        <span>
+          Sources <b>{sources.length}</b>
+        </span>
+      </button>
+      {open && (
+        <ol>
+          {sources.map((s) => (
+            <li key={s.n}>
+              <a href={safeUrl(s.url)} target="_blank" rel="noopener noreferrer" title={s.snippet || s.title}>
+                <span className="src-n">{s.n}</span>
+                <span className="src-title">{s.title}</span>
+                <span className="src-host">{hostOf(s.url)}</span>
+              </a>
+            </li>
+          ))}
+        </ol>
+      )}
     </div>
   );
 }
