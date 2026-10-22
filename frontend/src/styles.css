@@ -1817,6 +1817,237 @@ a.cite:hover {
   }
 }
 
+/* ── login ───────────────────────────────────────────────────────────── */
+.auth-page {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(900px 500px at 50% -10%, rgba(34, 211, 238, 0.1), transparent 70%),
+    var(--bg);
+}
+
+.auth-card {
+  width: min(100%, 400px);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 14px;
+  padding: 32px 28px 26px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 18px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(34, 211, 238, 0.04);
+}
+
+.auth-card > svg {
+  align-self: center;
+}
+
+.auth-card h1 {
+  margin: 4px 0 0;
+  text-align: center;
+  font-size: 22px;
+  letter-spacing: -0.02em;
+}
+
+.auth-sub {
+  margin: -6px 0 4px;
+  text-align: center;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.auth-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  padding: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+}
+
+.auth-tabs button {
+  padding: 7px 0;
+  background: transparent;
+  color: var(--muted);
+  border: 0;
+  border-radius: 8px;
+  font-size: 13.5px;
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s;
+}
+
+.auth-tabs button.on {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  box-shadow: inset 0 0 0 1px var(--accent-line);
+}
+
+.auth-card form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.auth-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.auth-card input {
+  width: 100%;
+  height: 42px;
+  padding: 0 12px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  font-size: 14.5px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.auth-card input:focus {
+  border-color: var(--accent-line);
+  box-shadow: var(--glow);
+}
+
+.auth-card input::placeholder {
+  color: var(--faint);
+}
+
+.auth-password {
+  position: relative;
+}
+
+.auth-password input {
+  padding-right: 42px;
+}
+
+.auth-eye {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  background: none;
+  border: 0;
+  color: var(--faint);
+  cursor: pointer;
+}
+
+.auth-eye:hover {
+  color: var(--accent-strong);
+}
+
+.auth-submit {
+  width: 100%;
+  margin-top: 2px;
+}
+
+.auth-error,
+.auth-notice {
+  padding: 9px 12px;
+  border-radius: 9px;
+  font-size: 13.5px;
+}
+
+.auth-error {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border: 1px solid rgba(255, 90, 90, 0.25);
+}
+
+.auth-notice {
+  background: var(--info-bg);
+  color: var(--info);
+  border: 1px solid var(--accent-line);
+}
+
+.auth-switch {
+  margin: 2px 0 0;
+  text-align: center;
+  font-size: 13.5px;
+  color: var(--muted);
+}
+
+.splash {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  color: var(--muted);
+}
+
+.splash p {
+  margin: 0;
+}
+
+/* signed-in user, at the bottom of the sidebar */
+.user-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  border-top: 1px solid var(--border);
+}
+
+.user-avatar {
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  border: 1px solid var(--accent-line);
+  font: 600 12px var(--mono);
+}
+
+.user-email {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.user-logout {
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  background: transparent;
+  color: var(--faint);
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s;
+}
+
+.user-logout:hover {
+  color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.user-logout svg {
+  width: 16px;
+  height: 16px;
+}
+
 /* ── narrow screens: sidebar becomes a slide-over ───────── */
 @media (max-width: 760px) {
   .app {

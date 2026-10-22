@@ -152,3 +152,15 @@ export interface UsageReport {
   daily: { date: string; cost_usd: number; total_tokens: number; replies: number }[];
   top_conversations: { id: string; title: string; cost_usd: number; replies: number }[];
 }
+
+/** The signed-in account. */
+export interface User {
+  id: string;
+  email: string;
+}
+
+/** Returned by signup and login: the JWT to send on every later request, and who it belongs to. */
+export interface AuthResponse {
+  token: string;
+  user: User;
+}

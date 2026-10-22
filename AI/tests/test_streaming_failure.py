@@ -149,8 +149,8 @@ class FakeRequest:
         return self.disconnect_on_poll is not None and self.polls >= self.disconnect_on_poll
 
 
-def start_turn(db, settings, llm):
-    cid = db.create_conversation()["id"]
+def start_turn(db, settings, llm, uid):
+    cid = db.create_conversation(uid)["id"]
     return cid, begin_turn(db, llm, settings, cid, "question")
 
 
@@ -158,9 +158,9 @@ async def drain(gen):
     return [chunk async for chunk in gen]
 
 
-async def test_client_disconnect_stops_generation_and_saves_partial_as_cancelled(db, settings):
+async def test_client_disconnect_stops_generation_and_saves_partial_as_cancelled(db, settings, uid):
     llm = ScriptedLLM(ok_script("one ", "two ", "three ", "four "))
-    cid, turn = start_turn(db, settings, llm)
+    cid, turn = start_turn(db, settings, llm, uid)
 
     # the 3rd is_disconnected() poll says "the browser is gone"
     chunks = await drain(stream_reply(
@@ -175,7 +175,7 @@ async def test_client_disconnect_stops_generation_and_saves_partial_as_cancelled
     assert llm.upstream_closed is True  # the provider stream was closed -> generation can stop
 
 
-async def test_task_cancellation_while_waiting_for_the_model_saves_partial(db, settings):
+async def test_task_cancellation_while_waiting_for_the_model_saves_partial(db, settings, uid):
     """If the browser disconnects while we are BLOCKED waiting for the next
     token, is_disconnected() can't run; the server cancels our task instead."""
     gate = asyncio.Event()
@@ -189,7 +189,7 @@ async def test_task_cancellation_while_waiting_for_the_model_saves_partial(db, s
                 self.upstream_closed = True
 
     llm = StallingLLM([])
-    cid, turn = start_turn(db, settings, llm)
+    cid, turn = start_turn(db, settings, llm, uid)
 
     async def consume():
         async for _ in stream_reply(
@@ -210,7 +210,7 @@ async def test_task_cancellation_while_waiting_for_the_model_saves_partial(db, s
     assert llm.upstream_closed is True
 
 
-async def test_partial_text_is_checkpointed_to_the_database_while_streaming(db, settings):
+async def test_partial_text_is_checkpointed_to_the_database_while_streaming(db, settings, uid):
     """Crash safety: text must reach SQLite DURING the stream, not only at the end."""
     snapshots = []
 
@@ -223,7 +223,7 @@ async def test_partial_text_is_checkpointed_to_the_database_while_streaming(db, 
             yield Completed("completed", None)
 
     llm = SnapshotLLM([])
-    cid, turn = start_turn(db, settings, llm)
+    cid, turn = start_turn(db, settings, llm, uid)
     await drain(stream_reply(
         request=FakeRequest(), db=db, llm=llm, settings=settings,
         prices=PriceTable(), turn=turn, started_at=0.0,
@@ -231,9 +231,9 @@ async def test_partial_text_is_checkpointed_to_the_database_while_streaming(db, 
     assert snapshots and snapshots[0].startswith("alpha")
 
 
-def test_assistant_row_exists_in_streaming_state_before_the_model_is_called(db, settings):
+def test_assistant_row_exists_in_streaming_state_before_the_model_is_called(db, settings, uid):
     llm = ScriptedLLM([])
-    cid = db.create_conversation()["id"]
+    cid = db.create_conversation(uid)["id"]
     begin_turn(db, llm, settings, cid, "question")  # note: stream NOT started yet
 
     rows = db.list_messages(cid)

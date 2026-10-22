@@ -27,6 +27,7 @@ def _parse(created_at: str) -> datetime:
 def build_usage_report(
     db: Database,
     prices: PriceTable,
+    user_id: str,
     *,
     days: int = 30,
     utc_offset_minutes: int = 0,
@@ -39,7 +40,7 @@ def build_usage_report(
     # The UTC instant at which `first_day` began on the user's clock.
     since = datetime.combine(first_day, time.min, tzinfo=timezone.utc) - offset
 
-    reply_rows, call_rows = db.usage_rows(since)
+    reply_rows, call_rows = db.usage_rows(user_id, since)
     calls: list[dict[str, Any]] = []
     for r in reply_rows:
         calls.append({**r, "purpose": "reply"})

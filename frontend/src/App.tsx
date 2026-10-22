@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, deleteConversation, listConversations } from "./api";
 import Chat from "./Chat";
-import { ChartIcon, CheckIcon, LogoMark, MenuIcon, PlusIcon, SearchIcon, TrashIcon } from "./Icons";
+import { useAuth } from "./AuthContext";
+import { ChartIcon, CheckIcon, LogoMark, LogoutIcon, MenuIcon, PlusIcon, SearchIcon, TrashIcon } from "./Icons";
+import Login from "./Login";
 import { RateProvider } from "./rate";
 import Usage from "./Usage";
 import type { Conversation } from "./types";
@@ -46,7 +48,9 @@ function groupByDay(items: Conversation[]): { label: string; items: Conversation
   return groups.filter((g) => g.items.length > 0);
 }
 
-export default function App() {
+/** The signed-in app. Remounted per user (see App below), so no one ever sees another account's state. */
+function Workspace() {
+  const { user, logout } = useAuth();
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [listState, setListState] = useState<"loading" | "ready" | "error">("loading");
   const [selectedId, setSelectedId] = useState<string | null>(idFromHash);
@@ -247,6 +251,17 @@ export default function App() {
           >
             <ChartIcon /> Usage
           </button>
+          <div className="user-row">
+            <span className="user-avatar" aria-hidden>
+              {(user?.email ?? "?")[0].toUpperCase()}
+            </span>
+            <span className="user-email" title={user?.email}>
+              {user?.email}
+            </span>
+            <button className="user-logout" onClick={logout} title="Sign out" aria-label="Sign out">
+              <LogoutIcon />
+            </button>
+          </div>
         </aside>
 
         <main className="main">
@@ -260,4 +275,27 @@ export default function App() {
       </div>
     </RateProvider>
   );
+}
+
+function Splash({ text, action }: { text: string; action?: { label: string; run: () => void } }) {
+  return (
+    <div className="splash">
+      <LogoMark width={44} height={44} />
+      <p>{text}</p>
+      {action && (
+        <button className="btn btn-primary" onClick={action.run}>
+          {action.label}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Login is required: nothing but the login screen exists until there is a valid session. */
+export default function App() {
+  const { status, user, retry } = useAuth();
+  if (status === "checking") return <Splash text="Checking your session…" />;
+  if (status === "unreachable") return <Splash text="Can't reach the server." action={{ label: "Try again", run: retry }} />;
+  if (status === "anonymous" || !user) return <Login />;
+  return <Workspace key={user.id} />;
 }

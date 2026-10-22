@@ -24,7 +24,7 @@ DATA_DIR = BASE_DIR / "data"  # the price table
 
 # Values copied verbatim from .env.example. If one of these is still in place,
 # the user forgot to edit the file; say so instead of sending it to OpenAI.
-_PLACEHOLDERS = {"", "your_key", "your_model", "your_api_key", "your_model_name"}
+_PLACEHOLDERS = {"", "your_key", "your_model", "your_api_key", "your_model_name", "your_jwt_secret", "change_me"}
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful, concise assistant in a chat application. "
@@ -70,6 +70,14 @@ class Settings:
     retry_base_delay_s: float = 0.5
     partial_flush_interval_s: float = 1.0
 
+    # Authentication (JWT). The secret signs every login token: anyone who knows it can forge
+    # a token for any user, so it must be long, random and private.
+    jwt_secret: str | None = None
+    jwt_expires_days: float = 7.0
+    password_min_length: int = 8
+    signup_enabled: bool = True
+    auth_rate_limit_per_minute: int = 10  # login/signup attempts per client IP
+
     database_url: str = "postgresql://streambot:streambot@localhost:5440/streambot"
     db_pool_max: int = 10
     prices_path: Path = DATA_DIR / "prices.toml"
@@ -96,6 +104,13 @@ class Settings:
     def validate(self) -> None:
         """Fail fast with an actionable message. Called once at server startup."""
         problems: list[str] = []
+        secret = (self.jwt_secret or "").strip()
+        if secret.lower() in _PLACEHOLDERS or len(secret) < 32:
+            problems.append(
+                "JWT_SECRET is missing, a placeholder, or shorter than 32 characters. Generate one with:\n"
+                "      python -c \"import secrets; print(secrets.token_urlsafe(48))\"\n"
+                "    and put it in .env (never commit it)."
+            )
         if not self.database_url.startswith(("postgresql://", "postgres://")):
             problems.append(
                 "DATABASE_URL must be a PostgreSQL URL like postgresql://user:password@localhost:5440/streambot "
@@ -169,6 +184,11 @@ class Settings:
             llm_max_attempts=number("LLM_MAX_ATTEMPTS", 2, integer=True, minimum=1),
             retry_base_delay_s=number("RETRY_BASE_DELAY_S", 0.5),
             partial_flush_interval_s=number("PARTIAL_FLUSH_INTERVAL_S", 1.0),
+            jwt_secret=text("JWT_SECRET"),
+            jwt_expires_days=number("JWT_EXPIRES_DAYS", 7.0, minimum=0.01),
+            password_min_length=number("PASSWORD_MIN_LENGTH", 8, integer=True, minimum=8),
+            signup_enabled=(text("SIGNUP_ENABLED", "true") or "true").lower() not in ("0", "false", "no", "off"),
+            auth_rate_limit_per_minute=number("AUTH_RATE_LIMIT_PER_MINUTE", 10, integer=True),
             database_url=text("DATABASE_URL", "postgresql://streambot:streambot@localhost:5440/streambot") or "",
             db_pool_max=number("DB_POOL_MAX", 10, integer=True, minimum=1),
             prices_path=path("PRICES_PATH", DATA_DIR / "prices.toml"),

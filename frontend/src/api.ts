@@ -9,9 +9,12 @@ import type {
   StreamHandlers,
   TitleEvent,
   ToolCallEvent,
+  AuthResponse,
   ToolResultEvent,
   UsageReport,
+  User,
 } from "./types";
+import { getToken, notifyUnauthorized } from "./auth";
 
 // The browser only ever talks to OUR backend. There is no OpenAI key (or any
 // secret) in this bundle: Vite inlines VITE_* variables into public JavaScript,
@@ -42,17 +45,48 @@ async function readError(res: Response): Promise<ApiError> {
   return new ApiError(detail, res.status);
 }
 
+/** Headers for a request that needs a login: the bearer token (a JWT) from localStorage. */
+function authHeaders(extra?: HeadersInit): Headers {
+  const headers = new Headers(extra);
+  const token = getToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  return headers;
+}
+
+/** fetch() with the token attached. A 401 means "your login no longer works": tell the app once. */
+async function authedFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const res = await fetch(`${API_URL}${path}`, { ...init, headers: authHeaders(init.headers) });
+  if (res.status === 401) notifyUnauthorized();
+  return res;
+}
+
 async function json<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_URL}${path}`, init);
+  const res = await authedFetch(path, init);
   if (!res.ok) throw await readError(res);
   return res.json() as Promise<T>;
 }
+
+// Signup and login are the only calls made WITHOUT a token. A 401 here just means "wrong
+// password", so it must not trigger the global logout.
+async function publicJson<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${API_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await readError(res);
+  return res.json() as Promise<T>;
+}
+
+export const signup = (email: string, password: string) => publicJson<AuthResponse>("/auth/signup", { email, password });
+export const login = (email: string, password: string) => publicJson<AuthResponse>("/auth/login", { email, password });
+export const getMe = () => json<User>("/auth/me");
 
 export const listConversations = () => json<Conversation[]>("/conversations");
 export const createConversation = () => json<Conversation>("/conversations", { method: "POST" });
 export const getConversation = (id: string) => json<ConversationDetail>(`/conversations/${id}`);
 export async function deleteConversation(id: string): Promise<void> {
-  const res = await fetch(`${API_URL}/conversations/${id}`, { method: "DELETE" });
+  const res = await authedFetch(`/conversations/${id}`, { method: "DELETE" });
   if (!res.ok) throw await readError(res);
 }
 export interface Info {
@@ -90,7 +124,7 @@ export async function streamMessage(
   signal: AbortSignal,
   webSearch = true,
 ): Promise<void> {
-  const res = await fetch(`${API_URL}/conversations/${conversationId}/messages`, {
+  const res = await authedFetch(`/conversations/${conversationId}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text, web_search: webSearch }),

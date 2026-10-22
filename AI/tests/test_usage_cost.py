@@ -221,9 +221,9 @@ def test_error_before_any_token_also_has_null_usage(make_client):
     assert row["status"] == "error" and row["total_tokens"] is None and row["cost_usd"] is None
 
 
-async def test_cancelled_reply_without_reported_usage_stores_null(settings, db):
+async def test_cancelled_reply_without_reported_usage_stores_null(settings, db, uid):
     llm = ScriptedLLM(ok_script("a ", "b ", "c "))
-    cid = db.create_conversation()["id"]
+    cid = db.create_conversation(uid)["id"]
     turn = begin_turn(db, llm, settings, cid, "q")
     _ = [c async for c in stream_reply(request=FakeRequest(disconnect_on_poll=2), db=db, llm=llm,
                                        settings=settings, prices=PriceTable(), turn=turn, started_at=0.0)]
@@ -232,13 +232,13 @@ async def test_cancelled_reply_without_reported_usage_stores_null(settings, db):
     assert row["total_tokens"] is None and row["cost_usd"] is None  # never invented
 
 
-async def test_cancelled_reply_keeps_usage_if_the_provider_had_reported_it(settings, db, tmp_path):
+async def test_cancelled_reply_keeps_usage_if_the_provider_had_reported_it(settings, db, tmp_path, uid):
     prices_file = tmp_path / "p.toml"
     prices_file.write_text('[models."gpt-5.6-luna"]\ninput = 0.20\ncached_input = 0.02\noutput = 1.20\n')
     usage = Usage(1000, 300, 1300, cached_input_tokens=200)
     # final event arrives, then the client disconnects before the stream fully closes
     llm = ScriptedLLM([TextDelta("hi"), Completed("completed", usage, MODEL), TextDelta("late")], model=MODEL)
-    cid = db.create_conversation()["id"]
+    cid = db.create_conversation(uid)["id"]
     turn = begin_turn(db, llm, settings, cid, "q")
     _ = [c async for c in stream_reply(request=FakeRequest(disconnect_on_poll=3), db=db, llm=llm,
                                        settings=settings, prices=PriceTable.load(prices_file),

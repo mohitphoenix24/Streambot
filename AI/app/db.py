@@ -120,37 +120,79 @@ class Database:
 
         migrate(self)
 
-    # ── conversations ────────────────────────────────────────────────────
-    def create_conversation(self, title: str = "New chat") -> dict[str, Any]:
-        now = _now()
-        conv = {"id": _new_id(), "title": title, "created_at": now, "updated_at": now}
+    # ── users ────────────────────────────────────────────────────────────
+    def create_user(self, email: str, password_hash: str) -> dict[str, Any]:
+        """Create an account. Raises psycopg.errors.UniqueViolation if the email is taken."""
+        user = {"id": _new_id(), "email": email.strip().lower(), "password_hash": password_hash, "created_at": _now()}
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO conversations (id, title, created_at, updated_at) "
-                "VALUES (%(id)s, %(title)s, %(created_at)s, %(updated_at)s)",
-                conv,
+                "INSERT INTO users (id, email, password_hash, created_at) "
+                "VALUES (%(id)s, %(email)s, %(password_hash)s, %(created_at)s)",
+                user,
             )
-        return _clean(conv)  # type: ignore[return-value]
+        return _clean(user)  # type: ignore[return-value]
 
-    def list_conversations(self) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT id, title, created_at, updated_at FROM conversations "
-                "ORDER BY updated_at DESC, seq DESC"
-            ).fetchall()
-        return [_clean(r) for r in rows]  # type: ignore[misc]
-
-    def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
+    def get_user(self, user_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT id, title, created_at, updated_at FROM conversations WHERE id = %s",
-                (conversation_id,),
+                "SELECT id, email, password_hash, created_at FROM users WHERE id = %s", (user_id,)
             ).fetchone()
         return _clean(row)
 
-    def delete_conversation(self, conversation_id: str) -> bool:
+    def set_password_hash(self, user_id: str, password_hash: str) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE users SET password_hash = %s WHERE id = %s", (password_hash, user_id))
+
+    def get_user_by_email(self, email: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id, email, password_hash, created_at FROM users WHERE email = %s", (email.strip().lower(),)
+            ).fetchone()
+        return _clean(row)
+
+    # ── conversations ────────────────────────────────────────────────────
+    # Every conversation belongs to one user, and every query that starts from a request takes
+    # that user's id. Asking for someone else's conversation finds NOTHING (the same answer as
+    # a conversation that does not exist), so ids can never be used to probe other accounts.
+    def create_conversation(self, user_id: str, title: str = "New chat") -> dict[str, Any]:
+        now = _now()
+        conv = {"id": _new_id(), "user_id": user_id, "title": title, "created_at": now, "updated_at": now}
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO conversations (id, user_id, title, created_at, updated_at) "
+                "VALUES (%(id)s, %(user_id)s, %(title)s, %(created_at)s, %(updated_at)s)",
+                conv,
+            )
+        conv.pop("user_id")
+        return _clean(conv)  # type: ignore[return-value]
+
+    def list_conversations(self, user_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, title, created_at, updated_at FROM conversations WHERE user_id = %s "
+                "ORDER BY updated_at DESC, seq DESC",
+                (user_id,),
+            ).fetchall()
+        return [_clean(r) for r in rows]  # type: ignore[misc]
+
+    def get_conversation(self, conversation_id: str, user_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id, title, created_at, updated_at FROM conversations WHERE id = %s AND user_id = %s",
+                (conversation_id, user_id),
+            ).fetchone()
+        return _clean(row)
+
+    def conversation_owner(self, conversation_id: str) -> str | None:
+        """Who owns this conversation, for server-side work that starts from a conversation
+        id the server already trusts (background summaries, title calls). Never for requests."""
+        with self.connect() as conn:
+            row = conn.execute("SELECT user_id FROM conversations WHERE id = %s", (conversation_id,)).fetchone()
+        return row["user_id"] if row else None
+
+    def delete_conversation(self, conversation_id: str, user_id: str) -> bool:
         """Delete a conversation; its messages go with it (ON DELETE CASCADE).
-        Returns False if there was no such conversation.
+        Returns False if there was no such conversation (or it is not this user's).
 
         The content is gone, but what it COST is not: each reply's usage numbers are copied
         to `archived_replies` in the same transaction first, so spend history stays true.
@@ -158,16 +200,18 @@ class Database:
         with self.connect() as conn:
             conn.execute(
                 "INSERT INTO archived_replies "
-                "(id, conversation_id, model, served_model, input_tokens, cached_input_tokens, output_tokens, "
-                " reasoning_tokens, total_tokens, cost_usd, web_searches, created_at, archived_at) "
-                "SELECT id, conversation_id, model, served_model, input_tokens, cached_input_tokens, output_tokens, "
-                "       reasoning_tokens, total_tokens, cost_usd, web_searches, created_at, %s "
-                "FROM messages WHERE conversation_id = %s AND role = 'assistant' "
-                "  AND (total_tokens IS NOT NULL OR cost_usd IS NOT NULL) "
+                "(id, user_id, conversation_id, model, served_model, input_tokens, cached_input_tokens, "
+                " output_tokens, reasoning_tokens, total_tokens, cost_usd, web_searches, created_at, archived_at) "
+                "SELECT m.id, c.user_id, m.conversation_id, m.model, m.served_model, m.input_tokens, "
+                "       m.cached_input_tokens, m.output_tokens, m.reasoning_tokens, m.total_tokens, m.cost_usd, "
+                "       m.web_searches, m.created_at, %s "
+                "FROM messages m JOIN conversations c ON c.id = m.conversation_id "
+                "WHERE m.conversation_id = %s AND c.user_id = %s AND m.role = 'assistant' "
+                "  AND (m.total_tokens IS NOT NULL OR m.cost_usd IS NOT NULL) "
                 "ON CONFLICT (id) DO NOTHING",
-                (_now(), conversation_id),
+                (_now(), conversation_id, user_id),
             )
-            cur = conn.execute("DELETE FROM conversations WHERE id = %s", (conversation_id,))
+            cur = conn.execute("DELETE FROM conversations WHERE id = %s AND user_id = %s", (conversation_id, user_id))
         return cur.rowcount > 0
 
     def get_summary(self, conversation_id: str) -> tuple[str | None, str | None]:
@@ -185,7 +229,7 @@ class Database:
                 (summary, through_message_id, conversation_id),
             )
 
-    def add_llm_call(self, conversation_id: str | None, purpose: str, model: str, **fields: Any) -> str:
+    def add_llm_call(self, user_id: str, conversation_id: str | None, purpose: str, model: str, **fields: Any) -> str:
         """Record a non-reply model call. `fields` are the usage columns and cost_usd."""
         allowed = {"served_model", "input_tokens", "cached_input_tokens", "output_tokens",
                    "reasoning_tokens", "total_tokens", "cost_usd"}
@@ -193,7 +237,7 @@ class Database:
         if unknown:
             raise ValueError(f"cannot record columns: {sorted(unknown)}")
         call_id = _new_id()
-        columns = {"id": call_id, "conversation_id": conversation_id, "purpose": purpose,
+        columns = {"id": call_id, "user_id": user_id, "conversation_id": conversation_id, "purpose": purpose,
                    "model": model, "created_at": _now(), **fields}
         with self.connect() as conn:
             conn.execute(
@@ -213,8 +257,8 @@ class Database:
                 ).fetchall()
         return [_clean(r) for r in rows]  # type: ignore[misc]
 
-    def usage_rows(self, since: datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Everything that cost (or may have cost) money since `since` (an aware datetime):
+    def usage_rows(self, user_id: str, since: datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Everything this user spent (or may have spent) since `since` (an aware datetime):
         assistant replies that reported usage, and title/summary calls.
         Replies carry the conversation title (None if the chat was deleted since)."""
         with self.connect() as conn:
@@ -222,24 +266,24 @@ class Database:
                 "SELECT m.id, m.conversation_id, c.title AS conversation_title, m.model, m.served_model, "
                 "       m.input_tokens, m.cached_input_tokens, m.output_tokens, m.reasoning_tokens, "
                 "       m.total_tokens, m.cost_usd, m.web_searches, m.created_at "
-                "FROM messages m LEFT JOIN conversations c ON c.id = m.conversation_id "
-                "WHERE m.role = 'assistant' AND m.created_at >= %s "
+                "FROM messages m JOIN conversations c ON c.id = m.conversation_id "
+                "WHERE c.user_id = %s AND m.role = 'assistant' AND m.created_at >= %s "
                 "  AND (m.total_tokens IS NOT NULL OR m.cost_usd IS NOT NULL) "
                 "ORDER BY m.created_at",
-                (since,),
+                (user_id, since),
             ).fetchall()
             calls = conn.execute(
                 "SELECT id, conversation_id, purpose, model, served_model, input_tokens, cached_input_tokens, "
                 "       output_tokens, reasoning_tokens, total_tokens, cost_usd, created_at "
-                "FROM llm_calls WHERE created_at >= %s ORDER BY created_at",
-                (since,),
+                "FROM llm_calls WHERE user_id = %s AND created_at >= %s ORDER BY created_at",
+                (user_id, since),
             ).fetchall()
             archived = conn.execute(
                 "SELECT id, conversation_id, NULL AS conversation_title, model, served_model, input_tokens, "
                 "       cached_input_tokens, output_tokens, reasoning_tokens, total_tokens, cost_usd, "
                 "       web_searches, created_at "
-                "FROM archived_replies WHERE created_at >= %s ORDER BY created_at",
-                (since,),
+                "FROM archived_replies WHERE user_id = %s AND created_at >= %s ORDER BY created_at",
+                (user_id, since),
             ).fetchall()
         # Replies of deleted chats count like any other reply; they just have no chat to link to.
         return [_clean(r) for r in replies] + [_clean(r) for r in archived], [_clean(r) for r in calls]  # type: ignore[misc]

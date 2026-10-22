@@ -25,6 +25,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
+from app.auth.routes import build_auth
 from app.config import Settings
 from app.db import Database
 from app.core.fx import UsdInrProvider
@@ -53,7 +54,8 @@ def create_app(
     settings = settings or Settings.from_env()
     db = Database(settings.database_url, pool_max=settings.db_pool_max)
     prices = PriceTable.load(settings.prices_path)
-    limiter = SlidingWindowLimiter(settings.rate_limit_per_minute)
+    limiter = SlidingWindowLimiter(settings.rate_limit_per_minute)  # chat requests, per USER
+    auth_router, current_user = build_auth(settings, db)
     fx = fx or UsdInrProvider(settings.usd_to_inr, settings.usd_to_inr_fallback)
     if search is None and settings.tavily_api_key:
         search = TavilySearch(settings.tavily_api_key, settings.web_search_max_results)
@@ -78,6 +80,7 @@ def create_app(
 
     app = FastAPI(title="Streaming Chat", lifespan=lifespan)
     app.state.settings = settings
+    app.include_router(auth_router)  # /auth/signup, /auth/login, /auth/me: the only open routes besides /health
     app.state.db = db
 
     # Body-size cap: added BEFORE CORS so CORS ends up outermost and even our 413
@@ -104,24 +107,26 @@ def create_app(
     def get_llm(request: Request) -> LLM:
         return request.app.state.llm
 
-    def require_conversation(conversation_id: str) -> dict:
-        conv = db.get_conversation(conversation_id)
+    def require_conversation(conversation_id: str, user: dict) -> dict:
+        # Someone else's conversation looks exactly like one that does not exist (404, not 403),
+        # so conversation ids cannot be used to find out what other accounts have.
+        conv = db.get_conversation(conversation_id, user["id"])
         if conv is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         return conv
 
-    def prepare_send(request: Request, conversation_id: str, body: SendMessageIn) -> str:
+    def prepare_send(user: dict, conversation_id: str, body: SendMessageIn) -> str:
         """Every check a chat request must pass BEFORE any model money is spent."""
-        # request.client is the direct peer. Behind a reverse proxy that is the
-        # proxy's IP for everyone; production must use a trusted X-Forwarded-For.
-        retry_after = limiter.check(request.client.host if request.client else "unknown")
+        # The limit is per logged-in USER, not per IP: many people can share an address
+        # (an office, a phone network), and one person can use many.
+        retry_after = limiter.check(user["id"])
         if retry_after is not None:
             raise HTTPException(
                 status_code=429,
                 detail="Too many requests. Please slow down.",
                 headers={"Retry-After": str(math.ceil(retry_after))},
             )
-        require_conversation(conversation_id)
+        require_conversation(conversation_id, user)
         text = validated_text(body)
         # One reply at a time per conversation. Two concurrent generations would
         # interleave their messages and each would see a history missing the other.
@@ -143,16 +148,16 @@ def create_app(
         return body.text
 
     # ── Conversations ────────────────────────────────────────────────────
-    # Everything is read from SQLite on every request, so a page refresh (or a
+    # Everything is read from PostgreSQL on every request, so a page refresh (or a
     # server restart) loses nothing: the database, not memory, is the truth.
 
     @app.post("/conversations", response_model=ConversationOut, status_code=201)
-    async def create_conversation() -> dict:
-        return db.create_conversation()
+    async def create_conversation(user: dict = Depends(current_user)) -> dict:
+        return db.create_conversation(user["id"])
 
     @app.get("/conversations", response_model=list[ConversationOut])
-    async def list_conversations() -> list[dict]:
-        return db.list_conversations()
+    async def list_conversations(user: dict = Depends(current_user)) -> list[dict]:
+        return db.list_conversations(user["id"])
 
     def to_message_out(m: dict) -> MessageOut:
         """A stored row as the API shape, plus what the prompt cache saved (needs the price table)."""
@@ -160,10 +165,8 @@ def create_app(
         return MessageOut(**m, cache_savings_usd=saved)
 
     @app.get("/conversations/{conversation_id}", response_model=ConversationDetail)
-    async def get_conversation(conversation_id: str) -> ConversationDetail:
-        conv = db.get_conversation(conversation_id)
-        if conv is None:
-            raise HTTPException(status_code=404, detail="Conversation not found")
+    async def get_conversation(conversation_id: str, user: dict = Depends(current_user)) -> ConversationDetail:
+        conv = require_conversation(conversation_id, user)
         return ConversationDetail(
             **conv,
             messages=[to_message_out(m) for m in db.list_messages(conversation_id)],
@@ -171,15 +174,15 @@ def create_app(
         )
 
     @app.delete("/conversations/{conversation_id}", status_code=204)
-    async def delete_conversation(conversation_id: str) -> Response:
-        require_conversation(conversation_id)
+    async def delete_conversation(conversation_id: str, user: dict = Depends(current_user)) -> Response:
+        require_conversation(conversation_id, user)
         # Deleting under a live stream would orphan the reply being written.
         if db.has_streaming_message(conversation_id):
             raise HTTPException(
                 status_code=409,
                 detail="A reply is still being generated in this conversation. Press Stop first.",
             )
-        db.delete_conversation(conversation_id)
+        db.delete_conversation(conversation_id, user["id"])
         return Response(status_code=204)
 
     # ── The streaming endpoint (what the React app calls) ────────────────
@@ -189,10 +192,11 @@ def create_app(
     # no body, so the frontend uses fetch() and reads the response body itself.
     @app.post("/conversations/{conversation_id}/messages")
     async def send_message(
-        conversation_id: str, body: SendMessageIn, request: Request, llm: LLM = Depends(get_llm)
+        conversation_id: str, body: SendMessageIn, request: Request,
+        llm: LLM = Depends(get_llm), user: dict = Depends(current_user),
     ) -> StreamingResponse:
         started_at = time.perf_counter()  # t0 for time-to-first-token
-        text = prepare_send(request, conversation_id, body)
+        text = prepare_send(user, conversation_id, body)
         turn = begin_turn(db, llm, settings, conversation_id, text)
         # A fresh runner per reply: it owns the [1], [2], ... citation numbering.
         tools = ToolRunner(search) if (search is not None and body.web_search) else None
@@ -220,10 +224,11 @@ def create_app(
     # exactly that; it is the one the React app uses.
     @app.post("/conversations/{conversation_id}/messages/sync", response_model=MessageOut)
     async def send_message_sync(
-        conversation_id: str, body: SendMessageIn, request: Request, llm: LLM = Depends(get_llm)
+        conversation_id: str, body: SendMessageIn, request: Request,
+        llm: LLM = Depends(get_llm), user: dict = Depends(current_user),
     ) -> dict:
         started_at = time.perf_counter()
-        text = prepare_send(request, conversation_id, body)
+        text = prepare_send(user, conversation_id, body)
         # Same preparation as the streaming path: save the user message, create
         # the placeholder assistant row, build budgeted history from the DB.
         turn = begin_turn(db, llm, settings, conversation_id, text)
@@ -251,13 +256,14 @@ def create_app(
     async def usage(
         days: int = Query(30, ge=1, le=365),
         utc_offset_minutes: int = Query(0, ge=-840, le=840),
+        user: dict = Depends(current_user),
     ) -> dict:
         """Spend, tokens, cache hit rate and savings for the Usage page. Days are the
         caller's days: the browser passes its own UTC offset (east positive)."""
-        return build_usage_report(db, prices, days=days, utc_offset_minutes=utc_offset_minutes)
+        return build_usage_report(db, prices, user["id"], days=days, utc_offset_minutes=utc_offset_minutes)
 
     @app.get("/info")
-    async def info(request: Request) -> dict[str, str | float | bool | None]:
+    async def info(request: Request, user: dict = Depends(current_user)) -> dict[str, str | float | bool | None]:
         """Which model this server uses plus the display exchange rate. No secrets."""
         rate = await fx.get()
         return {

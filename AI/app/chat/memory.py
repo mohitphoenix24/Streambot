@@ -102,7 +102,8 @@ class MemoryManager:
 
     async def _update(self, conversation_id: str) -> bool:
         db = self._db
-        if db.get_conversation(conversation_id) is None:
+        owner = db.conversation_owner(conversation_id)  # the server's own lookup, not a request's
+        if owner is None:
             return False
         summary, through_id = db.get_summary(conversation_id)
         plan = plan_summary(db.list_messages(conversation_id), through_id, self._settings.history_budget_tokens)
@@ -114,8 +115,8 @@ class MemoryManager:
         if result is None:
             return False  # keep the old summary; plain truncation still protects the budget
 
-        record_llm_call(db, self._prices, conversation_id, "summary", result)
-        if db.get_conversation(conversation_id) is None:
+        record_llm_call(db, self._prices, owner, conversation_id, "summary", result)
+        if db.conversation_owner(conversation_id) is None:
             return False  # the chat was deleted while we were summarizing
         db.set_summary(conversation_id, result.text, plan.through_id)
         log.info(

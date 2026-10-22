@@ -8,6 +8,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.auth.passwords import hash_password
+from app.auth.tokens import create_token
 from app.config import Settings
 from app.db import Database
 from tests.helpers import ScriptedLLM, ok_script
@@ -28,6 +30,14 @@ def forbid_real_network(monkeypatch):
 
     monkeypatch.setattr(httpx2.AsyncClient, "send", blocked)
     monkeypatch.setattr(httpx.AsyncClient, "send", blocked)  # also the live FX lookup
+
+
+# ── accounts for tests ───────────────────────────────────────────────────
+# argon2 is slow ON PURPOSE (~100 ms and 64 MB per hash), so hash the test password ONCE and
+# reuse it. The auth tests themselves use the real hasher.
+TEST_PASSWORD = "correct-horse-battery"
+TEST_PASSWORD_HASH = hash_password(TEST_PASSWORD)
+TEST_JWT_SECRET = "test-secret-" + "x" * 40
 
 
 # ── PostgreSQL for tests ─────────────────────────────────────────────────
@@ -77,11 +87,24 @@ def db(database_url):
 
 
 @pytest.fixture
+def user(db):
+    """An account in the test database."""
+    return db.create_user("user@example.com", TEST_PASSWORD_HASH)
+
+
+@pytest.fixture
+def uid(user):
+    return user["id"]
+
+
+@pytest.fixture
 def settings(tmp_path, database_url):
     return Settings(
         openai_api_key="test-key",  # never used: tests inject a ScriptedLLM
         openai_model="test-model",
         database_url=database_url,
+        jwt_secret=TEST_JWT_SECRET,
+        auth_rate_limit_per_minute=0,  # the auth tests that need a limit turn it on
         prices_path=tmp_path / "prices.toml",  # absent -> no prices unless a test writes one
         rate_limit_per_minute=0,
         usd_to_inr=88.0,  # fixed: tests must not fetch a live exchange rate
@@ -97,11 +120,25 @@ def make_client(settings):
 
     def _make(llm=None, search=None, **overrides):
         s = Settings(**{**settings.__dict__, **overrides})
-        client = TestClient(create_app(s, llm or ScriptedLLM(ok_script("hi")), search=search))
+        app = create_app(s, llm or ScriptedLLM(ok_script("hi")), search=search)
+        client = TestClient(app)
         client.__enter__()  # runs lifespan: schema creation + crash recovery
         clients.append(client)
+        # Log in by default, so the endpoint tests exercise the real, protected API.
+        # get-or-create: a test that "restarts the server" must get the SAME account back
+        client.user = app.state.db.get_user_by_email("user@example.com") or app.state.db.create_user("user@example.com", TEST_PASSWORD_HASH)
+        client.headers["Authorization"] = f"Bearer {create_token(client.user['id'], s.jwt_secret, 7)}"
         return client
 
     yield _make
     for c in clients:
         c.__exit__(None, None, None)
+
+
+def client_for(client, email="other@example.com"):
+    """A second logged-in user talking to the SAME app and database (for isolation tests)."""
+    app = client.app
+    other = TestClient(app)
+    other.user = app.state.db.create_user(email, TEST_PASSWORD_HASH)
+    other.headers["Authorization"] = f"Bearer {create_token(other.user['id'], app.state.settings.jwt_secret, 7)}"
+    return other

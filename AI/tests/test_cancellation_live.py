@@ -16,6 +16,7 @@ import uvicorn
 from app.main import create_app
 from app.config import Settings
 from app.db import Database
+from tests.conftest import TEST_JWT_SECRET, TEST_PASSWORD_HASH
 from app.llm.client import Completed, TextDelta
 from tests.helpers import ScriptedLLM
 
@@ -41,7 +42,7 @@ def live_server(database_url):
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    settings = Settings(openai_api_key="test-key", openai_model="test-model", database_url=database_url, rate_limit_per_minute=0,
+    settings = Settings(openai_api_key="test-key", openai_model="test-model", database_url=database_url, jwt_secret=TEST_JWT_SECRET, rate_limit_per_minute=0,
                         partial_flush_interval_s=0.1)
     llm = EndlessLLM([])
     server = uvicorn.Server(uvicorn.Config(create_app(settings, llm), host="127.0.0.1", port=port, log_level="warning"))
@@ -52,7 +53,11 @@ def live_server(database_url):
         time.sleep(0.02)
     assert server.started, "server did not start"
     database = Database(database_url)
-    yield f"http://127.0.0.1:{port}", database, llm
+    from app.auth.tokens import create_token
+
+    user = database.create_user("live@example.com", TEST_PASSWORD_HASH)
+    headers = {"Authorization": f"Bearer {create_token(user['id'], TEST_JWT_SECRET, 7)}"}
+    yield f"http://127.0.0.1:{port}", database, llm, headers
     server.should_exit = True
     thread.join(timeout=5)
     database.close()
@@ -69,11 +74,11 @@ def wait_for(predicate, timeout=5.0):
 
 
 def test_closing_the_connection_cancels_the_reply_and_stops_the_model(live_server):
-    base, db, llm = live_server
-    cid = httpx.post(f"{base}/conversations").json()["id"]
+    base, db, llm, headers = live_server
+    cid = httpx.post(f"{base}/conversations", headers=headers).json()["id"]
 
     deltas = 0
-    with httpx.stream("POST", f"{base}/conversations/{cid}/messages", json={"text": "go"}, timeout=10) as r:
+    with httpx.stream("POST", f"{base}/conversations/{cid}/messages", json={"text": "go"}, headers=headers, timeout=10) as r:
         for line in r.iter_lines():
             if line.startswith("event: delta"):
                 deltas += 1

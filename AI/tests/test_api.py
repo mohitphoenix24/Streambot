@@ -192,9 +192,9 @@ def test_streaming_response_headers_disable_buffering_and_caching(make_client):
 
 
 # ── crash recovery ───────────────────────────────────────────────────────
-def test_replies_orphaned_by_a_crash_become_errors_on_startup_with_text_kept(make_client, settings, db):
+def test_replies_orphaned_by_a_crash_become_errors_on_startup_with_text_kept(make_client, settings, db, uid):
     db.init_schema()
-    cid = db.create_conversation()["id"]
+    cid = db.create_conversation(uid)["id"]
     db.add_message(cid, "user", "q")
     orphan = db.add_message(cid, "assistant", status="streaming")
     db.update_message(orphan["id"], content="half an answer")  # last checkpoint before kill -9

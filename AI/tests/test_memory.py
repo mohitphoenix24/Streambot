@@ -112,11 +112,11 @@ def test_a_summary_pointing_at_an_unknown_message_is_ignored():
 
 # ── MemoryManager ────────────────────────────────────────────────────────
 @pytest.fixture
-def setup(db, database_url):
+def setup(db, database_url, uid):
     settings = Settings(openai_api_key="k", openai_model="m", database_url=database_url, history_budget_tokens=1000)
     llm = ScriptedLLM(ok_script("x"))
     manager = MemoryManager(db, llm, PriceTable(), settings)
-    cid = db.create_conversation()["id"]
+    cid = db.create_conversation(uid)["id"]
     return db, llm, manager, cid
 
 
@@ -187,13 +187,13 @@ async def test_concurrent_runs_summarize_only_once(setup):
     assert sorted(results) == [False, True] and len(llm.summary_requests) == 1
 
 
-async def test_a_chat_deleted_mid_summary_is_handled(setup):
+async def test_a_chat_deleted_mid_summary_is_handled(setup, uid):
     db, llm, manager, cid = setup
     fill(db, cid, 20)
     real = llm.summarize
 
     async def delete_then_answer(prev, msgs):
-        db.delete_conversation(cid)
+        db.delete_conversation(cid, uid)
         return await real(prev, msgs)
 
     llm.summarize = delete_then_answer

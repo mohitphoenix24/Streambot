@@ -38,7 +38,7 @@ def test_placeholder_model_is_rejected(model):
 
 
 def test_valid_openai_settings_pass():
-    Settings(openai_api_key="sk-real", openai_model="some-model").validate()
+    Settings(openai_api_key="sk-real", openai_model="some-model", jwt_secret="s" * 40).validate()
 
 
 def test_title_model_falls_back_to_main_model():

@@ -24,13 +24,13 @@ def usage_columns(usage: Usage | None) -> dict[str, int | None]:
 
 
 def record_llm_call(
-    db: Database, prices: PriceTable, conversation_id: str, purpose: str, generated: Generated
+    db: Database, prices: PriceTable, user_id: str, conversation_id: str, purpose: str, generated: Generated
 ) -> None:
     """Store one title/summary call. Usage is the provider's report; cost is None when the
     model has no price (never guessed), exactly as for replies."""
     cost = prices.cost(generated.model, generated.served_model, generated.usage)
     db.add_llm_call(
-        conversation_id, purpose, generated.model,
+        user_id, conversation_id, purpose, generated.model,
         served_model=generated.served_model,
         cost_usd=cost.total_cost if cost else None,
         **usage_columns(generated.usage),

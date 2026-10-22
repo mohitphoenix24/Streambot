@@ -360,6 +360,8 @@ async def stream_reply(
             log.warning("title_generation_failed conversation_id=%s", conversation_id, exc_info=True)
             generated = None
         if generated:
-            record_llm_call(db, prices, conversation_id, "title", generated)  # its cost is tracked too
+            owner = db.conversation_owner(conversation_id)
+            if owner is not None:
+                record_llm_call(db, prices, owner, conversation_id, "title", generated)  # its cost is tracked too
             db.set_title(conversation_id, generated.text)
             yield sse("title", {"title": generated.text})
