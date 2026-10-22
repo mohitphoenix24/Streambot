@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { getUsage } from "./api";
 import { axisTicks, barPercent, compactNumber, formatUsdAxis, labelIndexes, niceMax, shortDate } from "./chart";
 import { formatCost, formatInr } from "./format";
@@ -6,6 +6,12 @@ import { useRateInfo, useUsdToInr, describeRate } from "./rate";
 import type { UsageReport } from "./types";
 
 const RANGES = [7, 30, 90] as const;
+/**
+ * Size a figure to its tile: `.fit` (see styles.css) shrinks the font so `text` always fits the
+ * tile's width, so a long amount like "$0.006922" can never be clipped or spill into a neighbour.
+ */
+const fit = (text: string, maxPx: number) => ({ "--len": text.length, "--max": `${maxPx}px` }) as CSSProperties;
+
 const PURPOSE_LABEL = { reply: "Replies", title: "Chat titles", summary: "Memory summaries" } as const;
 
 /** "$0.0124 · ₹1.17" as two parts so the hero figure can put INR on its own line. */
@@ -92,7 +98,9 @@ function Report({ data }: { data: UsageReport }) {
       <div className="kpis">
         <div className="kpi hero" title={describeRate(rateInfo)}>
           <span className="kpi-label">Total spend</span>
-          <span className="hero-value">{money.usd(t.cost_usd)}</span>
+          <span className="hero-value fit" style={fit(money.usd(t.cost_usd), 48)}>
+            {money.usd(t.cost_usd)}
+          </span>
           {money.inr(t.cost_usd) && <span className="hero-inr">{money.inr(t.cost_usd)}</span>}
           <span className="kpi-note">
             {t.replies.toLocaleString()} {t.replies === 1 ? "reply" : "replies"} · {t.calls - t.replies} background {t.calls - t.replies === 1 ? "call" : "calls"}
@@ -101,7 +109,9 @@ function Report({ data }: { data: UsageReport }) {
 
         <div className="kpi">
           <span className="kpi-label">Tokens</span>
-          <span className="kpi-value">{compactNumber(t.total_tokens)}</span>
+          <span className="kpi-value fit" style={fit(compactNumber(t.total_tokens), 28)}>
+            {compactNumber(t.total_tokens)}
+          </span>
           <span className="kpi-note">
             {compactNumber(t.input_tokens)} input tokens · {compactNumber(t.output_tokens)} output tokens
           </span>
@@ -109,7 +119,9 @@ function Report({ data }: { data: UsageReport }) {
 
         <div className="kpi">
           <span className="kpi-label">Cache hit rate</span>
-          <span className="kpi-value">{hit === null ? "–" : `${(hit * 100).toFixed(0)}%`}</span>
+          <span className="kpi-value fit" style={fit(hit === null ? "–" : `${(hit * 100).toFixed(0)}%`, 28)}>
+            {hit === null ? "–" : `${(hit * 100).toFixed(0)}%`}
+          </span>
           <div className="meter" role="img" aria-label={hit === null ? "no data" : `${(hit * 100).toFixed(0)} percent of input tokens came from the cache`}>
             <span style={{ width: `${(hit ?? 0) * 100}%` }} />
           </div>
@@ -118,7 +130,9 @@ function Report({ data }: { data: UsageReport }) {
 
         <div className="kpi">
           <span className="kpi-label">Saved by caching</span>
-          <span className="kpi-value accent">{data.cache.savings_usd === null ? "n/a" : money.usd(data.cache.savings_usd)}</span>
+          <span className="kpi-value accent fit" style={fit(data.cache.savings_usd === null ? "n/a" : money.usd(data.cache.savings_usd), 28)}>
+            {data.cache.savings_usd === null ? "n/a" : money.usd(data.cache.savings_usd)}
+          </span>
           <span className="kpi-note">
             {data.cache.savings_usd !== null && money.inr(data.cache.savings_usd) ? `${money.inr(data.cache.savings_usd)} · ` : ""}
             vs. paying the normal input rate
@@ -127,7 +141,9 @@ function Report({ data }: { data: UsageReport }) {
 
         <div className="kpi">
           <span className="kpi-label">Web searches</span>
-          <span className="kpi-value">{t.web_searches.toLocaleString()}</span>
+          <span className="kpi-value fit" style={fit(t.web_searches.toLocaleString(), 28)}>
+            {t.web_searches.toLocaleString()}
+          </span>
           <span className="kpi-note">counted, not priced</span>
         </div>
       </div>
