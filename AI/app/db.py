@@ -384,6 +384,11 @@ class Database:
         Reciprocal Rank Fusion (RRF): a chunk scores 1/(60 + rank) from each list it appears in, so
         a passage that BOTH methods like beats one that only one likes. It needs no tuning, because
         it uses ranks, not the (incomparable) raw scores.
+
+        The keyword leg matches a passage that has ANY of the question's words (the `&` that
+        websearch_to_tsquery puts between terms becomes `|`) and ranks by how many it has and how
+        often. With AND semantics a natural-language question ("Can I get a refund?") would match
+        nothing, because no passage contains every word of it, including "get".
         """
         params = {"u": user_id, "c": conversation_id, "q": vector_literal(query_vector), "t": query_text,
                   "k": candidates, "n": limit}
@@ -397,11 +402,13 @@ class Database:
                     SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> %(q)s::vector) AS rank
                     FROM chunks WHERE user_id = %(u)s AND conversation_id = %(c)s
                     ORDER BY embedding <=> %(q)s::vector LIMIT %(k)s
+                ), parsed AS (
+                    SELECT replace(websearch_to_tsquery('english', %(t)s)::text, '&', '|')::tsquery AS query
                 ), kw AS (
-                    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, query) DESC) AS rank
-                    FROM chunks, websearch_to_tsquery('english', %(t)s) AS query
-                    WHERE user_id = %(u)s AND conversation_id = %(c)s AND tsv @@ query
-                    ORDER BY ts_rank_cd(tsv, query) DESC LIMIT %(k)s
+                    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, parsed.query) DESC) AS rank
+                    FROM chunks, parsed
+                    WHERE user_id = %(u)s AND conversation_id = %(c)s AND tsv @@ parsed.query
+                    ORDER BY ts_rank_cd(tsv, parsed.query) DESC LIMIT %(k)s
                 )
                 SELECT c.id, c.document_id, d.filename, c.page, c.heading, c.content,
                        vec.rank AS vector_rank, kw.rank AS keyword_rank,
