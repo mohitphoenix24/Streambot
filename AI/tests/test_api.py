@@ -414,3 +414,18 @@ def test_usage_endpoint_reports_replies_and_titles(make_client):
 @pytest.mark.parametrize("query", ["days=0", "days=400", "utc_offset_minutes=9999", "days=abc"])
 def test_usage_endpoint_validates_its_parameters(make_client, query):
     assert make_client().get(f"/usage?{query}").status_code == 422
+
+
+def test_deleting_a_chat_does_not_change_the_usage_totals(make_client):
+    client = make_client(ScriptedLLM(ok_script("x"), title="T"))
+    keep, gone = new_conversation(client), new_conversation(client)
+    send(client, keep, "stay")
+    send(client, gone, "go")
+    before = client.get("/usage?days=7").json()
+
+    assert client.delete(f"/conversations/{gone}").status_code == 204
+    after = client.get("/usage?days=7").json()
+
+    assert after["totals"] == before["totals"]  # the deleted chat's tokens were still spent
+    assert after["totals"]["replies"] == 2
+    assert [c["id"] for c in after["top_conversations"]] in ([keep], [])  # but it can't be linked to any more

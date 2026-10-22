@@ -119,9 +119,10 @@ def test_top_conversations_rank_by_cost_and_skip_deleted_chats(db):
     r = report(db)
     assert [c["title"] for c in r["top_conversations"]] == ["Pricey", "Cheap"]
     assert r["top_conversations"][0]["replies"] == 2
-    # Deleting a chat cascades to its reply rows, so its reply spend leaves the totals too
-    # (only title/summary calls are kept, see test_spend_on_side_calls_survives_deleting_the_chat).
-    assert r["totals"]["cost_usd"] == pytest.approx(0.016)
+    # The deleted chat's spend is still counted: the tokens were used either way...
+    assert r["totals"]["cost_usd"] == pytest.approx(0.116)
+    assert r["totals"]["replies"] == 4
+    # ...it just has no chat left to link to, so it is not in the ranking.
 
 
 def test_spend_on_side_calls_survives_deleting_the_chat(db):
@@ -142,3 +143,82 @@ def test_cancelled_replies_with_reported_usage_still_count(db):
     cid = db.create_conversation()["id"]
     reply(db, cid, "2026-10-22T09:00:00.000+00:00", status="cancelled", cost=0.0005)
     assert report(db)["totals"]["cost_usd"] == pytest.approx(0.0005)
+
+
+# ── deleting a chat must not rewrite spend history ───────────────────────
+def test_a_deleted_chats_usage_stays_on_the_day_it_happened(db):
+    cid = db.create_conversation()["id"]
+    reply(db, cid, "2026-10-20T09:00:00.000+00:00", inp=2000, cached=1000, cost=0.004, searches=3)
+    before = report(db)
+
+    db.delete_conversation(cid)
+    after = report(db)
+
+    assert after["totals"] == before["totals"]  # tokens, cost, replies, searches: all unchanged
+    assert after["cache"] == before["cache"]  # hit rate and savings too
+    assert after["daily"] == before["daily"]  # still on Oct 20, not on the day it was deleted
+    assert {p["purpose"]: p["calls"] for p in after["by_purpose"]}["reply"] == 1
+    assert [m["model"] for m in after["by_model"]] == ["m"]
+
+
+def test_the_archive_keeps_numbers_never_content(db):
+    cid = db.create_conversation()["id"]
+    msg_id = reply(db, cid, "2026-10-22T09:00:00.000+00:00")
+    db.update_message(msg_id, content="a private answer about my health")
+    db.delete_conversation(cid)
+
+    with db.connect() as conn:
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(archived_replies)")]
+        dump = " ".join(str(v) for row in conn.execute("SELECT * FROM archived_replies") for v in tuple(row))
+    assert "content" not in columns and "private" not in dump
+    assert db.get_message(msg_id) is None  # and the message itself really is gone
+
+
+def test_replies_without_usage_are_not_archived(db):
+    cid = db.create_conversation()["id"]
+    db.add_message(cid, "user", "hi")
+    db.add_message(cid, "assistant", "no usage was ever reported", status="error")
+    db.delete_conversation(cid)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM archived_replies").fetchone()[0] == 0
+
+
+def test_deleting_the_same_chat_twice_never_double_counts(db):
+    cid = db.create_conversation()["id"]
+    reply(db, cid, "2026-10-22T09:00:00.000+00:00", cost=0.002)
+    assert db.delete_conversation(cid) is True
+    assert db.delete_conversation(cid) is False
+    assert report(db)["totals"]["cost_usd"] == pytest.approx(0.002)
+
+
+def test_live_and_deleted_chats_add_up_without_overlap(db):
+    keep, gone = db.create_conversation("Keep")["id"], db.create_conversation("Gone")["id"]
+    reply(db, keep, "2026-10-22T09:00:00.000+00:00", cost=0.001)
+    reply(db, gone, "2026-10-22T09:01:00.000+00:00", cost=0.002)
+    reply(db, gone, "2026-10-22T09:02:00.000+00:00", cost=0.004)
+    side_call(db, gone, "title", "2026-10-22T09:00:30.000+00:00", cost=0.0003)
+    db.delete_conversation(gone)
+
+    r = report(db)
+    assert r["totals"]["cost_usd"] == pytest.approx(0.0073) and r["totals"]["replies"] == 3 and r["totals"]["calls"] == 4
+    assert [c["title"] for c in r["top_conversations"]] == ["Keep"]
+
+
+def test_old_databases_get_the_archive_table_on_startup(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE conversations(id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);"
+        "CREATE TABLE messages(id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,"
+        " role TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER,"
+        " total_tokens INTEGER, cost_usd REAL, stop_reason TEXT, model TEXT, ttft_ms REAL, latency_ms REAL, created_at TEXT NOT NULL);"
+    )
+    conn.commit(); conn.close()
+    migrated = Database(path)
+    migrated.init_schema()
+    cid = migrated.create_conversation()["id"]
+    reply(migrated, cid, "2026-10-22T09:00:00.000+00:00", cost=0.002)
+    migrated.delete_conversation(cid)
+    assert build_usage_report(migrated, PRICES, now=NOW, days=7)["totals"]["cost_usd"] == pytest.approx(0.002)

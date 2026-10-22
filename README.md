@@ -462,7 +462,7 @@ static instructions → static tool definitions → rolling summary → append-o
 
 ## Usage page
 
-`#/usage` (sidebar link) shows the last 7 / 30 / 90 days: total spend (USD with INR), tokens, cache hit rate, money saved by caching, web searches, a daily-spend chart, spend by purpose (replies / chat titles / memory summaries), spend by model and the most expensive chats. Everything comes from stored rows: replies carry their own usage and cost, and title/summary calls are in `llm_calls`. A call with no configured price is counted as *unpriced* and the total is flagged as a lower bound, never counted as $0. Days follow the browser's clock (it sends its UTC offset). Deleting a chat removes its reply rows, so its reply spend leaves these totals; title and summary spend is kept.
+`#/usage` (sidebar link) shows the last 7 / 30 / 90 days: total spend (USD with INR), tokens, cache hit rate, money saved by caching, web searches, a daily-spend chart, spend by purpose (replies / chat titles / memory summaries), spend by model and the most expensive chats. Everything comes from stored rows: replies carry their own usage and cost, and title/summary calls are in `llm_calls`. A call with no configured price is counted as *unpriced* and the total is flagged as a lower bound, never counted as $0. Days follow the browser's clock (it sends its UTC offset). Deleting a chat removes its content but **not its cost**: each reply's usage numbers (tokens, cost, searches, original date; never the text) are copied to `archived_replies` in the same transaction, so spend history stays true. A deleted chat just can't appear in "most expensive chats", since there is nothing left to link to.
 
 ## Cost accounting
 

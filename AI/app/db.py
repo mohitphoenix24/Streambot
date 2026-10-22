@@ -97,6 +97,25 @@ CREATE TABLE IF NOT EXISTS llm_calls (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_calls_created ON llm_calls (created_at);
 
+-- Usage of replies whose chat was deleted. Deleting a chat removes its CONTENT, but the
+-- tokens were spent either way, so each reply's numbers (never its text) are kept here.
+CREATE TABLE IF NOT EXISTS archived_replies (
+    id                  TEXT PRIMARY KEY,   -- the original message id
+    conversation_id     TEXT,
+    model               TEXT,
+    served_model        TEXT,
+    input_tokens        INTEGER,
+    cached_input_tokens INTEGER,
+    output_tokens       INTEGER,
+    reasoning_tokens    INTEGER,
+    total_tokens        INTEGER,
+    cost_usd            REAL,
+    web_searches        INTEGER,
+    created_at          TEXT NOT NULL,      -- when the reply happened (keeps it on the right day)
+    archived_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_archived_replies_created ON archived_replies (created_at);
+
 -- Loading a conversation = "all messages for conversation X, oldest first".
 CREATE INDEX IF NOT EXISTS idx_messages_conversation
     ON messages (conversation_id, created_at);
@@ -211,8 +230,22 @@ class Database:
 
     def delete_conversation(self, conversation_id: str) -> bool:
         """Delete a conversation; its messages go with it (ON DELETE CASCADE).
-        Returns False if there was no such conversation."""
+        Returns False if there was no such conversation.
+
+        The content is gone, but what it COST is not: each reply's usage numbers are copied
+        to `archived_replies` in the same transaction first, so spend history stays true.
+        """
         with self.connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO archived_replies "
+                "(id, conversation_id, model, served_model, input_tokens, cached_input_tokens, output_tokens, "
+                " reasoning_tokens, total_tokens, cost_usd, web_searches, created_at, archived_at) "
+                "SELECT id, conversation_id, model, served_model, input_tokens, cached_input_tokens, output_tokens, "
+                "       reasoning_tokens, total_tokens, cost_usd, web_searches, created_at, ? "
+                "FROM messages WHERE conversation_id = ? AND role = 'assistant' "
+                "  AND (total_tokens IS NOT NULL OR cost_usd IS NOT NULL)",
+                (_now(), conversation_id),
+            )
             cur = conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
         return cur.rowcount > 0
 
@@ -280,7 +313,15 @@ class Database:
                 "FROM llm_calls WHERE created_at >= ? ORDER BY created_at",
                 (since_iso,),
             ).fetchall()
-        return [dict(r) for r in replies], [dict(r) for r in calls]
+            archived = conn.execute(
+                "SELECT id, conversation_id, NULL AS conversation_title, model, served_model, input_tokens, "
+                "       cached_input_tokens, output_tokens, reasoning_tokens, total_tokens, cost_usd, "
+                "       web_searches, created_at "
+                "FROM archived_replies WHERE created_at >= ? ORDER BY created_at",
+                (since_iso,),
+            ).fetchall()
+        # Replies of deleted chats count like any other reply; they just have no chat to link to.
+        return [dict(r) for r in replies] + [dict(r) for r in archived], [dict(r) for r in calls]
 
     def set_title(self, conversation_id: str, title: str) -> None:
         with self.connect() as conn:
