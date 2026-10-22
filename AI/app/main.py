@@ -34,6 +34,7 @@ from app.llm.pricing import PriceTable
 from app.schemas import ConversationDetail, ConversationOut, MessageOut, SendMessageIn
 from app.tools.registry import ToolRunner
 from app.tools.web_search import TavilySearch
+from app.chat.memory import MemoryManager
 from app.chat.streaming import begin_turn, finalize_complete, stream_reply
 
 log = logging.getLogger("chat.app")
@@ -66,6 +67,7 @@ def create_app(
         # readable message, rather than on a user's first request.
         settings.validate()
         app.state.llm = llm or build_llm(settings)
+        app.state.memory = MemoryManager(db, app.state.llm, prices, settings)
         db.init_schema()
         orphaned = db.recover_interrupted()
         if orphaned:
@@ -190,7 +192,7 @@ def create_app(
         return StreamingResponse(
             stream_reply(
                 request=request, db=db, llm=llm, settings=settings, prices=prices,
-                turn=turn, started_at=started_at, tools=tools,
+                turn=turn, started_at=started_at, tools=tools, memory=request.app.state.memory,
             ),
             media_type="text/event-stream",
             headers={

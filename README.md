@@ -103,12 +103,14 @@ Streaming-Chat-App/
 │   │   ├── db.py             SQLite schema + data access
 │   │   ├── chat/
 │   │   │   ├── streaming.py  begin_turn() + stream_reply(): THE pipeline
-│   │   │   ├── history.py    approx_tokens(), build_history() (budgeted)
+│   │   │   ├── history.py    approx_tokens(), build_history() (budgeted, summary-aware)
+│   │   │   ├── memory.py     plan_summary() + MemoryManager: the rolling summary
 │   │   │   └── sse.py        sse(event, data) wire formatter
 │   │   ├── llm/
 │   │   │   ├── client.py     OpenAI Responses API: stream(), retry, error mapping, titles
 │   │   │   ├── usage.py      parse_usage(): provider-reported token usage
-│   │   │   └── pricing.py    PriceTable, cost = tokens × price / 1M (None if unpriced)
+│   │   │   ├── pricing.py    PriceTable, cost = tokens × price / 1M (None if unpriced)
+│   │   │   └── accounting.py usage columns + recording title/summary call costs
 │   │   ├── tools/
 │   │   │   ├── web_search.py  Tavily search -> numbered sources (safe errors, http(s) URLs only)
 │   │   │   └── registry.py    web_search tool definition + per-reply ToolRunner (citation numbering)
@@ -204,6 +206,8 @@ See [.env.example](.env.example) for the annotated file.
 | `OPENAI_TIMEOUT_S` | `60` | connect/inter-chunk timeout |
 | `MAX_OUTPUT_TOKENS` | `1024` | cap on generated tokens per reply |
 | `HISTORY_BUDGET_TOKENS` | `6000` | budget for past messages (not the context window) |
+| `MEMORY_SUMMARY_ENABLED` | `true` | fold old messages into a rolling summary instead of dropping them |
+| `OPENAI_SUMMARY_MODEL` | title model | model that writes the summaries |
 | `MAX_MESSAGE_CHARS` | `8000` | max user message size (413 above) |
 | `RATE_LIMIT_PER_MINUTE` | `20` | per-IP chat requests; `0` disables |
 | `LLM_MAX_ATTEMPTS` | `2` | total attempts per reply (1 = no retry) |
@@ -336,7 +340,7 @@ data: {"text": "Hello"}
 
 | Event | Payload | Client reaction |
 |---|---|---|
-| `start` | `user_message_id, assistant_message_id, history_messages, history_truncated` | swap temp ids for real ids; show truncation note |
+| `start` | `user_message_id, assistant_message_id, history_messages, history_truncated, history_summarized` | swap temp ids for real ids; show the summarized/truncation note |
 | `delta` | `{text}` | append text immediately |
 | `done` | `stop_reason, usage{input,cached_input,output,reasoning,total}, cost{input_cost,cached_input_cost,output_cost,total_cost}, requested_model, served_model, ttft_ms, latency_ms, web_searches, conversation_total_*` (usage/cost are `null` when unavailable) | stop loading/Stop button, show tokens + cost, render Markdown |
 | `error` | `{message, partial}` | keep partial text, show safe message |
@@ -392,7 +396,18 @@ Messages are kept as plain `{"role","content"}` dicts; `llm.to_openai_input()` i
 context window  ≥  instructions  +  HISTORY_BUDGET  +  new input  +  MAX_OUTPUT_TOKENS (+ margin)
 ```
 
-**Not implemented (documented upgrade path): a running summary.** Instead of forgetting what falls outside the budget, keep a short summary of dropped messages and send `[summary] + recent messages`. It preserves long-range facts cheaply but costs an extra model call and can distort details, so truncation comes first.
+**Rolling-summary memory.** Plain truncation silently forgets old messages, so long chats lose context. Instead, the oldest messages are folded into a short summary and every request sends `[summary] + recent messages`:
+
+```
+old messages ──summarize──▶ [summary]  +  recent messages (verbatim)  ──▶ LLM
+```
+
+- **When.** `plan_summary()` (`app/chat/memory.py`, a pure function) waits until the not-yet-summarized messages exceed 80 % of `HISTORY_BUDGET_TOKENS`, then folds the oldest ones until about 40 % remains verbatim. Summarizing in big, rare steps (hysteresis) keeps the start of the prompt identical between steps, which is what prompt caching needs.
+- **How.** After a reply completes, a background task (`MemoryManager`) asks the model to merge the newly old messages into the existing summary. It never delays a reply, runs one conversation at a time, and never raises: if the call fails the old summary stays and truncation still protects the budget.
+- **Storage.** `conversations.summary` plus `summary_through_id` (the last message the summary covers). Messages are never deleted or changed; only what is *sent* changes.
+- **What the model sees.** A `developer` message ("Summary of the earlier conversation…") first, then the messages after the boundary. The summary counts against the budget, and the verbatim part always opens with a user turn.
+- **Cost.** Summary and title calls are recorded in the `llm_calls` table with their usage and cost (no foreign key, so spend history survives deleting a chat). Summaries use `OPENAI_SUMMARY_MODEL`, falling back to the (cheap) title model.
+- **Trade-offs.** A summary can lose or distort details, and it costs an extra call each time the boundary moves. Turn it off with `MEMORY_SUMMARY_ENABLED=false`.
 
 ## Token accounting
 
@@ -520,6 +535,7 @@ cd frontend && npm run typecheck && npm test                   # TS typecheck + 
 | File | Covers |
 |---|---|
 | `test_history.py` | budget respected, newest preferred, errors/empty skipped, starts with user |
+| `test_memory.py` | when to summarize (hysteresis), what history looks like with a summary, the background manager (merge, failure, concurrency, deleted chat) |
 | `test_pricing.py` | known/unknown model, calculation, TOML loading/validation, no invented prices |
 | `test_sse.py` | exact wire format, JSON payload, newline safety |
 | `test_db.py` | create/get/update/list, FK + CHECK constraints, crash recovery, totals |

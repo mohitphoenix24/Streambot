@@ -92,7 +92,8 @@ def test_previous_turns_are_sent_to_the_model(make_client):
 
 def test_low_history_budget_makes_the_model_forget_and_says_so(make_client):
     llm = ScriptedLLM(ok_script("a" * 100))
-    client = make_client(llm, history_budget_tokens=40)
+    # Memory off: this exercises the plain-truncation safety net (see test_memory.py for summaries).
+    client = make_client(llm, history_budget_tokens=40, memory_summary_enabled=False)
     cid = new_conversation(client)
     send(client, cid, "x" * 100)  # first turn
     start = [d for n, d in parse_sse(send(client, cid, "second").text) if n == "start"][0]
@@ -297,3 +298,78 @@ def test_the_toggle_and_the_api_key_control_whether_tools_are_offered(make_clien
 def test_info_says_whether_web_search_is_available(make_client):
     assert make_client(search=search_tool()).get("/info").json()["web_search_available"] is True
     assert make_client().get("/info").json()["web_search_available"] is False
+
+
+# ── rolling memory through the API ───────────────────────────────────────
+import time  # noqa: E402
+
+
+def wait_for(predicate, timeout=3.0):
+    """The summary is written by a background task; poll instead of sleeping blindly."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_a_long_chat_gets_summarized_and_the_next_turn_uses_the_summary(make_client, settings):
+    llm = ScriptedLLM(ok_script("a" * 100))
+    client = make_client(llm, history_budget_tokens=200, max_message_chars=500)
+    cid = new_conversation(client)
+    db = Database(settings.database_path)
+
+    for i in range(6):
+        send(client, cid, f"question {i} " + "q" * 80)
+    assert wait_for(lambda: db.get_summary(cid)[0] is not None), "summary was never stored"
+    assert llm.summary_requests, "the summary call was never made"
+
+    events = parse_sse(send(client, cid, "and one more").text)
+    start = dict(events)["start"]
+    assert start["history_summarized"] is True
+    sent = llm.histories[-1]
+    assert sent[0]["role"] == "developer" and "SCRIPTED SUMMARY" in sent[0]["content"]
+    assert sent[1]["role"] == "user"  # the verbatim part still opens with a user turn
+    assert sent[-1] == {"role": "user", "content": "and one more"}
+    assert not any("question 0" in m["content"] for m in sent[1:])  # folded away, not repeated
+
+
+def test_short_chats_are_never_summarized(make_client, settings):
+    llm = ScriptedLLM(ok_script("hi"))
+    client = make_client(llm)
+    cid = new_conversation(client)
+    for i in range(3):
+        start = dict(parse_sse(send(client, cid, f"q{i}").text))["start"]
+        assert start["history_summarized"] is False
+    time.sleep(0.1)
+    assert llm.summary_requests == []
+
+
+def test_memory_can_be_switched_off(make_client, settings):
+    llm = ScriptedLLM(ok_script("a" * 100))
+    client = make_client(llm, history_budget_tokens=200, max_message_chars=500, memory_summary_enabled=False)
+    cid = new_conversation(client)
+    for i in range(6):
+        send(client, cid, f"question {i} " + "q" * 80)
+    time.sleep(0.2)
+    assert llm.summary_requests == [] and Database(settings.database_path).get_summary(cid) == (None, None)
+
+
+def test_the_title_call_is_recorded_in_llm_calls(make_client, settings):
+    client = make_client(ScriptedLLM(ok_script("ok"), title="A Title"))
+    cid = new_conversation(client)
+    send(client, cid, "hello")
+    (call,) = Database(settings.database_path).list_llm_calls(cid)
+    assert call["purpose"] == "title" and call["total_tokens"] == 36 and call["served_model"] == "title-snapshot"
+
+
+def test_a_failing_summary_never_breaks_the_chat(make_client, settings):
+    llm = ScriptedLLM(ok_script("a" * 100))
+    llm.summary_text = None  # every summary call fails
+    client = make_client(llm, history_budget_tokens=200, max_message_chars=500)
+    cid = new_conversation(client)
+    for i in range(8):
+        assert send(client, cid, f"question {i} " + "q" * 80).status_code == 200
+    reply = client.get(f"/conversations/{cid}").json()["messages"][-1]
+    assert reply["status"] == "complete"  # truncation kept the prompt bounded

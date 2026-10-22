@@ -46,7 +46,11 @@ CREATE TABLE IF NOT EXISTS conversations (
     id          TEXT PRIMARY KEY,
     title       TEXT NOT NULL,
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    -- Rolling memory: a summary of the oldest messages, and the id of the last message
+    -- it covers. Everything after that message is still sent verbatim.
+    summary             TEXT,
+    summary_through_id  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -74,6 +78,24 @@ CREATE TABLE IF NOT EXISTS messages (
     web_searches      INTEGER,  -- how many web searches this reply ran
     created_at        TEXT NOT NULL
 );
+
+-- Model calls that are not a chat reply (titles, summaries), so their cost is not lost.
+-- No foreign key on purpose: spend history must survive deleting the conversation.
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id                  TEXT PRIMARY KEY,
+    conversation_id     TEXT,
+    purpose             TEXT NOT NULL CHECK (purpose IN ('title', 'summary')),
+    model               TEXT NOT NULL,
+    served_model        TEXT,
+    input_tokens        INTEGER,
+    cached_input_tokens INTEGER,
+    output_tokens       INTEGER,
+    reasoning_tokens    INTEGER,
+    total_tokens        INTEGER,
+    cost_usd            REAL,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_created ON llm_calls (created_at);
 
 -- Loading a conversation = "all messages for conversation X, oldest first".
 CREATE INDEX IF NOT EXISTS idx_messages_conversation
@@ -106,6 +128,10 @@ _ADDED_COLUMNS = {
         "served_model": "TEXT",
         "sources": "TEXT",
         "web_searches": "INTEGER",
+    },
+    "conversations": {
+        "summary": "TEXT",
+        "summary_through_id": "TEXT",
     },
 }
 
@@ -189,6 +215,49 @@ class Database:
         with self.connect() as conn:
             cur = conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
         return cur.rowcount > 0
+
+    def get_summary(self, conversation_id: str) -> tuple[str | None, str | None]:
+        """(summary text, id of the last message it covers); (None, None) if there is none."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT summary, summary_through_id FROM conversations WHERE id = ?", (conversation_id,)
+            ).fetchone()
+        return (row["summary"], row["summary_through_id"]) if row and row["summary"] else (None, None)
+
+    def set_summary(self, conversation_id: str, summary: str, through_message_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE conversations SET summary = ?, summary_through_id = ? WHERE id = ?",
+                (summary, through_message_id, conversation_id),
+            )
+
+    def add_llm_call(self, conversation_id: str | None, purpose: str, model: str, **fields: Any) -> str:
+        """Record a non-reply model call. `fields` are the usage columns and cost_usd."""
+        allowed = {"served_model", "input_tokens", "cached_input_tokens", "output_tokens",
+                   "reasoning_tokens", "total_tokens", "cost_usd"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"cannot record columns: {sorted(unknown)}")
+        call_id = _new_id()
+        columns = {"id": call_id, "conversation_id": conversation_id, "purpose": purpose,
+                   "model": model, "created_at": _now(), **fields}
+        with self.connect() as conn:
+            conn.execute(
+                f"INSERT INTO llm_calls ({', '.join(columns)}) VALUES ({', '.join(':' + c for c in columns)})",
+                columns,  # column names come from the whitelist above, values are bound
+            )
+        return call_id
+
+    def list_llm_calls(self, conversation_id: str | None = None) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if conversation_id is None:
+                rows = conn.execute("SELECT * FROM llm_calls ORDER BY created_at, rowid").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM llm_calls WHERE conversation_id = ? ORDER BY created_at, rowid",
+                    (conversation_id,),
+                ).fetchall()
+        return [dict(r) for r in rows]
 
     def set_title(self, conversation_id: str, title: str) -> None:
         with self.connect() as conn:

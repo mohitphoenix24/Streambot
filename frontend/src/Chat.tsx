@@ -71,6 +71,7 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
   const [streaming, setStreaming] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
   const [historyTruncated, setHistoryTruncated] = useState(false);
+  const [historySummarized, setHistorySummarized] = useState(false);
   const [input, setInput] = useState("");
   const [showJump, setShowJump] = useState(false); // "jump to latest" while scrolled up
 
@@ -171,6 +172,7 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
     }
     const convId = idRef.current as string; // set above for a draft
     setHistoryTruncated(false);
+    setHistorySummarized(false);
     stickToBottom.current = true;
 
     // Optimistic UI: show the user's message and an empty assistant bubble
@@ -215,6 +217,7 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
             );
             assistantId = e.assistant_message_id;
             setHistoryTruncated(e.history_truncated);
+            setHistorySummarized(e.history_summarized);
           },
           // `delta`: append the new text immediately. THIS is what makes the
           // answer appear to be typed out live.
@@ -381,6 +384,11 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
           {messages.map((m) => (
             <Message key={m.id} message={m} />
           ))}
+          {historySummarized && !historyTruncated && (
+            <div className="notice notice-info">
+              This conversation is long: earlier messages are summarized so the model keeps the context.
+            </div>
+          )}
           {historyTruncated && (
             <div className="notice notice-info">
               This conversation is long: older messages were left out of what the model sees (history budget).

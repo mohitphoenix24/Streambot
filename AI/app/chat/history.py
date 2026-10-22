@@ -30,16 +30,16 @@ so:  window  >=  instructions + HISTORY_BUDGET + MAX_OUTPUT_TOKENS (+ safety mar
 This module knows nothing about HTTP, SQLite or OpenAI: messages in, messages
 out, which makes it trivial to unit test.
 
-UPGRADE PATH (documented, deliberately NOT implemented): a running summary.
-Instead of silently forgetting what falls outside the budget, keep a short
-summary of the dropped messages and send it as the first item:
+ROLLING SUMMARY (see memory.py): instead of silently forgetting what falls outside the
+budget, a background call folds the oldest messages into a short summary, and every
+request sends
 
-    old messages --summarize--> [summary]  +  recent messages  -->  LLM
+    [summary of everything older]  +  [the recent messages, verbatim]  -->  LLM
 
-That preserves long-range facts ("the user's name is Mohit, they're building a
-FastAPI app") at a fraction of the tokens. It costs an extra model call to
-produce and refresh the summary, and the summary itself can lose or distort
-details, which is why it is a second step after plain truncation works.
+That keeps long-range facts ("the user's name is Mohit, they're building a FastAPI
+app") at a fraction of the tokens. Plain truncation stays as the safety net: if the
+summary is missing, late, or the recent part is still too big, the oldest recent
+messages are dropped exactly as before.
 """
 from __future__ import annotations
 
@@ -71,6 +71,7 @@ class History:
     messages: list[HistoryMessage]
     truncated: bool  # True if older eligible messages were dropped to fit the budget
     approx_tokens: int  # estimated size of `messages`
+    summarized: bool = False  # True if `messages` opens with a summary of older messages
 
 
 def _eligible(message: dict[str, Any]) -> bool:
@@ -83,10 +84,39 @@ def _eligible(message: dict[str, Any]) -> bool:
     return message["status"] in ("complete", "cancelled") and bool(message["content"].strip())
 
 
-def build_history(messages: list[dict[str, Any]], budget_tokens: int) -> History:
+def eligible_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The messages that may be shown to the model (see _eligible), in order."""
+    return [m for m in messages if _eligible(m)]
+
+
+def summary_message(summary: str) -> HistoryMessage:
+    # `developer` is the Responses API role for standing instructions/context from us.
+    return {
+        "role": "developer",
+        "content": f"Summary of the earlier conversation (those messages are no longer included):\n{summary}",
+    }
+
+
+def build_history(
+    messages: list[dict[str, Any]],
+    budget_tokens: int,
+    summary: str | None = None,
+    summary_through_id: str | None = None,
+) -> History:
     """`messages` are DB rows in chronological order; the newest is the user's
-    current question. Returns the largest recent suffix that fits the budget."""
-    eligible = [m for m in messages if _eligible(m)]
+    current question. Returns the largest recent suffix that fits the budget,
+    preceded by the rolling summary when there is one."""
+    eligible = eligible_messages(messages)
+
+    summary_item: HistoryMessage | None = None
+    if summary and summary_through_id:
+        ids = [m.get("id") for m in eligible]
+        if summary_through_id in ids:
+            # Everything up to (and including) that message is covered by the summary.
+            eligible = eligible[ids.index(summary_through_id) + 1:]
+            summary_item = summary_message(summary)
+            budget_tokens = max(budget_tokens - approx_tokens(summary_item["content"]), 0)
+        # else: the summary points at a message we can't see; ignore it rather than guess.
 
     selected: list[dict[str, Any]] = []
     used = 0
@@ -121,8 +151,10 @@ def build_history(messages: list[dict[str, Any]], budget_tokens: int) -> History
         selected.pop(0)
         truncated = True
 
+    recent = [{"role": m["role"], "content": m["content"]} for m in selected]
     return History(
-        messages=[{"role": m["role"], "content": m["content"]} for m in selected],
+        messages=([summary_item] if summary_item else []) + recent,
         truncated=truncated,
-        approx_tokens=used,
+        approx_tokens=used + (approx_tokens(summary_item["content"]) if summary_item else 0),
+        summarized=summary_item is not None,
     )

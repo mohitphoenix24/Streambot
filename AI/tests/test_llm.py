@@ -238,7 +238,7 @@ async def test_title_uses_the_title_model_when_configured(llm_factory):
     response = NS(output_text='"Understanding RAG."')
     client = client_with(response)
     title = await llm_factory(client, openai_title_model="cheap-model").generate_title("How does RAG work?")
-    assert title == "Understanding RAG"
+    assert title.text == "Understanding RAG" and title.model == "cheap-model"
     assert client.responses.calls[0]["model"] == "cheap-model"
 
 
@@ -393,3 +393,52 @@ async def test_parallel_calls_in_one_round_all_run(llm_factory):
     assert len(tools.calls) == 3
     outputs = [i for i in client.responses.calls[1]["input"] if i.get("type") == "function_call_output"]
     assert [o["call_id"] for o in outputs] == ["c1", "c2", "c3"]
+
+
+# ── rolling-summary call ─────────────────────────────────────────────────
+async def test_summarize_sends_the_old_summary_and_new_messages_to_the_summary_model(llm_factory):
+    response = NS(status="completed", output_text="  - User is Mohit\n  ", model="snap",
+                  usage=NS(input_tokens=120, output_tokens=30, total_tokens=150))
+    client = client_with(response)
+    llm = llm_factory(client, openai_summary_model="summary-model")
+
+    result = await llm.summarize("- likes FastAPI", [{"role": "user", "content": "I am Mohit"}, {"role": "assistant", "content": "Hi Mohit"}])
+
+    assert result.text == "- User is Mohit" and result.model == "summary-model" and result.served_model == "snap"
+    assert (result.usage.input_tokens, result.usage.output_tokens) == (120, 30)
+    (call,) = client.responses.calls
+    assert call["model"] == "summary-model" and call["store"] is False and "stream" not in call
+    assert "- likes FastAPI" in call["input"] and "User: I am Mohit" in call["input"] and "Assistant: Hi Mohit" in call["input"]
+    assert "Never invent" in call["instructions"]
+
+
+async def test_summary_model_defaults_to_the_title_model(llm_factory):
+    client = client_with(NS(status="completed", output_text="s", usage=None))
+    await llm_factory(client, openai_title_model="cheap").summarize(None, [{"role": "user", "content": "x"}])
+    assert client.responses.calls[0]["model"] == "cheap"
+    assert "(none yet)" in client.responses.calls[0]["input"]
+
+
+async def test_one_huge_message_is_truncated_in_the_summary_request(llm_factory):
+    client = client_with(NS(status="completed", output_text="s", usage=None))
+    await llm_factory(client).summarize(None, [{"role": "user", "content": "x" * 50_000}])
+    assert len(client.responses.calls[0]["input"]) < 6_000
+
+
+@pytest.mark.parametrize("response", [
+    NS(status="completed", output_text="   ", usage=None),  # empty
+    NS(status="incomplete", output_text="half a sum", usage=None),  # cut off
+])
+async def test_unusable_summaries_are_dropped(llm_factory, response):
+    assert await llm_factory(client_with(response)).summarize(None, [{"role": "user", "content": "x"}]) is None
+
+
+async def test_a_failed_summary_call_returns_none(llm_factory):
+    llm = llm_factory(client_with(openai.APIConnectionError(request=REQ)))
+    assert await llm.summarize(None, [{"role": "user", "content": "x"}]) is None
+
+
+async def test_title_call_now_reports_its_usage(llm_factory):
+    response = NS(output_text="A Title", model="snap", usage=NS(input_tokens=20, output_tokens=5, total_tokens=25))
+    title = await llm_factory(client_with(response)).generate_title("hi")
+    assert title.text == "A Title" and title.usage.total_tokens == 25 and title.served_model == "snap"

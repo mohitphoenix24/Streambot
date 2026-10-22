@@ -120,3 +120,47 @@ def test_conversation_totals_sum_cost_and_flag_unpriced(db):
         "total_cost_usd": 0.25, "total_tokens": 150, "total_input_tokens": 110,
         "total_cached_input_tokens": 0, "total_output_tokens": 40, "unpriced_messages": 1,
     }
+
+
+# ── rolling summary + side-call accounting ───────────────────────────────
+def test_summary_roundtrip_and_default(db):
+    cid = db.create_conversation()["id"]
+    assert db.get_summary(cid) == (None, None)
+    db.set_summary(cid, "- likes FastAPI", "m-17")
+    assert db.get_summary(cid) == ("- likes FastAPI", "m-17")
+    assert "summary" not in db.get_conversation(cid)  # the API shape of a conversation is unchanged
+
+
+def test_llm_calls_are_recorded_and_survive_deleting_the_conversation(db):
+    cid = db.create_conversation()["id"]
+    db.add_llm_call(cid, "title", "m", served_model="snap", input_tokens=10, output_tokens=2, total_tokens=12, cost_usd=0.0001)
+    db.add_llm_call(cid, "summary", "m", cost_usd=None)
+    assert [c["purpose"] for c in db.list_llm_calls(cid)] == ["title", "summary"]
+
+    db.delete_conversation(cid)
+    assert len(db.list_llm_calls()) == 2  # spend history outlives the chat
+
+
+def test_llm_calls_reject_unknown_purpose_and_columns(db):
+    import sqlite3
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.add_llm_call(None, "gossip", "m")
+    with pytest.raises(ValueError):
+        db.add_llm_call(None, "title", "m", evil="1; DROP TABLE messages")
+
+
+def test_old_databases_gain_the_summary_columns(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE conversations(id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+    conn.execute("INSERT INTO conversations VALUES ('c', 't', 'x', 'x')")
+    conn.commit(); conn.close()
+
+    migrated = Database(path)
+    migrated.init_schema()
+    assert migrated.get_summary("c") == (None, None)
+    migrated.set_summary("c", "s", "m1")
+    assert migrated.get_summary("c") == ("s", "m1")

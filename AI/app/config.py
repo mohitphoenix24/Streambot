@@ -41,6 +41,7 @@ class Settings:
     openai_api_key: str | None = None
     openai_model: str | None = None
     openai_title_model: str | None = None
+    openai_summary_model: str | None = None
     openai_timeout_s: float = 60.0
 
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
@@ -53,6 +54,8 @@ class Settings:
     # The context window is the MODEL's hard limit. This is OUR budget for the
     # history part only. See history.py for why they are different numbers.
     history_budget_tokens: int = 6000
+    # Rolling memory: summarize the oldest messages instead of dropping them.
+    memory_summary_enabled: bool = True
 
     # Display-only: OpenAI bills in USD; the UI shows an INR equivalent too.
     # None = fetch the live rate (USD_TO_INR=auto); a number = fixed rate; 0 = hide.
@@ -83,6 +86,11 @@ class Settings:
     def title_model(self) -> str | None:
         """Model for title generation: the cheap one if configured, else the main one."""
         return self.openai_title_model or self.openai_model
+
+    @property
+    def summary_model(self) -> str | None:
+        """Model for memory summaries: its own setting, else the (cheap) title model."""
+        return self.openai_summary_model or self.title_model
 
     def validate(self) -> None:
         """Fail fast with an actionable message. Called once at server startup."""
@@ -139,12 +147,14 @@ class Settings:
             openai_api_key=text("OPENAI_API_KEY"),
             openai_model=text("OPENAI_MODEL"),
             openai_title_model=text("OPENAI_TITLE_MODEL"),
+            openai_summary_model=text("OPENAI_SUMMARY_MODEL"),
             openai_timeout_s=number("OPENAI_TIMEOUT_S", 60.0, minimum=1),
             system_prompt=text("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT) or DEFAULT_SYSTEM_PROMPT,
             tavily_api_key=text("TAVILY_API_KEY"),
             web_search_max_results=number("WEB_SEARCH_MAX_RESULTS", 5, integer=True, minimum=1),
             max_output_tokens=number("MAX_OUTPUT_TOKENS", 1024, integer=True, minimum=16),
             history_budget_tokens=number("HISTORY_BUDGET_TOKENS", 6000, integer=True, minimum=1),
+            memory_summary_enabled=(text("MEMORY_SUMMARY_ENABLED", "true") or "true").lower() not in ("0", "false", "no", "off"),
             usd_to_inr=None if (text("USD_TO_INR", "auto") or "auto").lower() == "auto"
             else number("USD_TO_INR", 0.0),
             usd_to_inr_fallback=number("USD_TO_INR_FALLBACK", 96.0, minimum=1),

@@ -77,6 +77,8 @@ export interface StartEvent {
   assistant_message_id: string;
   history_messages: number;
   history_truncated: boolean;
+  /** The history opens with a rolling summary of older messages. */
+  history_summarized: boolean;
 }
 export interface DeltaEvent {
   text: string;

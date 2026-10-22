@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any, AsyncIterator
 
-from app.llm.client import Completed, Completion, HistoryMessage, LLMEvent, TextDelta, Usage
+from app.llm.client import Completed, Completion, Generated, HistoryMessage, LLMEvent, TextDelta, Usage
 
 
 class ScriptedLLM:
@@ -27,6 +27,8 @@ class ScriptedLLM:
         self.upstream_closed = False  # did the app close the provider stream?
         self.title_requests: list[str] = []
         self.tools_seen: list = []  # the ToolExecutor (or None) passed for each reply
+        self.summary_requests: list[tuple[str | None, list[HistoryMessage]]] = []  # (previous summary, folded messages)
+        self.summary_text: str | None = "SCRIPTED SUMMARY"  # None = the summary call fails
 
     async def stream(self, history: list[HistoryMessage], tools=None) -> AsyncIterator[LLMEvent]:
         self.histories.append(history)
@@ -43,9 +45,15 @@ class ScriptedLLM:
         self.histories.append(history)
         return Completion("complete-text", "completed", Usage(10, 5, 15))
 
-    async def generate_title(self, first_user_text: str) -> str | None:
+    async def generate_title(self, first_user_text: str) -> Generated | None:
         self.title_requests.append(first_user_text)
-        return self.title
+        return Generated(self.title, Usage(30, 6, 36), "title-snapshot", self.model) if self.title else None
+
+    async def summarize(self, previous_summary, messages) -> Generated | None:
+        self.summary_requests.append((previous_summary, messages))
+        if self.summary_text is None:
+            return None
+        return Generated(self.summary_text, Usage(200, 40, 240), "summary-snapshot", self.model)
 
 
 def ok_script(*chunks: str, usage: Usage | None = Usage(100, 50, 150), stop: str = "completed",

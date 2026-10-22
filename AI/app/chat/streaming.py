@@ -31,6 +31,7 @@ from app.llm.client import (
     LLM, UNAVAILABLE, Completed, HistoryMessage, LLMError, TextDelta, ToolCallFinished,
     ToolCallStarted, ToolExecutor, Usage,
 )
+from app.llm.accounting import record_llm_call, usage_columns
 from app.llm.pricing import CostBreakdown, PriceTable
 from app.chat.sse import sse
 
@@ -46,6 +47,7 @@ class Turn:
     history: list[HistoryMessage]
     history_truncated: bool
     is_first_message: bool
+    history_summarized: bool = False  # history opens with a summary of older messages
 
 
 def begin_turn(db: Database, llm: LLM, settings: Settings, conversation_id: str, text: str) -> Turn:
@@ -75,20 +77,12 @@ def begin_turn(db: Database, llm: LLM, settings: Settings, conversation_id: str,
     #    The empty 'streaming' placeholder created in step 2 is skipped by the
     #    builder, and so are failed replies. The newest message is the question
     #    we just saved.
-    history = build_history(db.list_messages(conversation_id), settings.history_budget_tokens)
+    summary, summary_through_id = db.get_summary(conversation_id)
+    history = build_history(
+        db.list_messages(conversation_id), settings.history_budget_tokens, summary, summary_through_id
+    )
 
-    return Turn(user_msg, assistant_msg, history.messages, history.truncated, is_first)
-
-
-def usage_columns(usage: Usage | None) -> dict[str, int | None]:
-    """DB columns for a usage record. No usage -> all NULL (never invented)."""
-    return {
-        "input_tokens": usage.input_tokens if usage else None,
-        "cached_input_tokens": usage.cached_input_tokens if usage else None,
-        "output_tokens": usage.output_tokens if usage else None,
-        "reasoning_tokens": usage.reasoning_tokens if usage else None,
-        "total_tokens": usage.total_tokens if usage else None,
-    }
+    return Turn(user_msg, assistant_msg, history.messages, history.truncated, is_first, history.summarized)
 
 
 def web_columns(sources: list[dict[str, Any]] | None, web_searches: int) -> dict[str, Any]:
@@ -163,6 +157,7 @@ async def stream_reply(
     turn: Turn,
     started_at: float,
     tools: ToolExecutor | None = None,
+    memory: Any = None,  # a MemoryManager: updates the rolling summary after a good reply
 ) -> AsyncIterator[str]:
     """Async generator yielding SSE-formatted strings. FastAPI's StreamingResponse
     sends each yielded string to the browser as soon as it is produced.
@@ -194,6 +189,7 @@ async def stream_reply(
         "assistant_message_id": assistant_id,
         "history_messages": len(turn.history),
         "history_truncated": turn.history_truncated,
+        "history_summarized": turn.history_summarized,
     })
 
     try:
@@ -322,6 +318,10 @@ async def stream_reply(
     assert completed is not None
     usage = completed.usage
     totals = db.conversation_totals(conversation_id)
+    if memory is not None:
+        # Before the first yield below: a client that hangs up right after `done` must not
+        # stop the summary from being kept up to date.
+        memory.schedule(conversation_id)
     yield sse("done", {
         "stop_reason": completed.stop_reason,
         # Provider-reported counts, or null when OpenAI sent none. Never estimated.
@@ -346,8 +346,8 @@ async def stream_reply(
     # Model routing: naming a chat is easy, answering is hard. Setting
     # OPENAI_TITLE_MODEL to a cheaper model for this call and keeping the stronger
     # model for answers is a common way to cut cost without hurting quality where
-    # users can tell. (Its tokens are not attributed to any message, so conversation
-    # cost above excludes title calls.)
+    # users can tell. (Its tokens belong to no message, so they are recorded in the
+    # llm_calls table instead of the conversation cost shown above.)
     # Trigger: this is the conversation's FIRST COMPLETED reply (not merely the first
     # message). If the first answer was stopped or failed, the next successful one
     # still earns the conversation a proper title.
@@ -355,10 +355,11 @@ async def stream_reply(
     if sum(1 for r in rows if r["role"] == "assistant" and r["status"] == "complete") == 1:
         first_user_text = next(r["content"] for r in rows if r["role"] == "user")
         try:
-            title = await llm.generate_title(first_user_text)
+            generated = await llm.generate_title(first_user_text)
         except Exception:
             log.warning("title_generation_failed conversation_id=%s", conversation_id, exc_info=True)
-            title = None
-        if title:
-            db.set_title(conversation_id, title)
-            yield sse("title", {"title": title})
+            generated = None
+        if generated:
+            record_llm_call(db, prices, conversation_id, "title", generated)  # its cost is tracked too
+            db.set_title(conversation_id, generated.text)
+            yield sse("title", {"title": generated.text})

@@ -52,6 +52,16 @@ class Completion:
 
 
 @dataclass(frozen=True)
+class Generated:
+    """Text from a small side call (a title or a summary) plus what it cost to make."""
+
+    text: str
+    usage: Usage | None
+    served_model: str | None
+    model: str  # the model we asked for
+
+
+@dataclass(frozen=True)
 class TextDelta:
     """A small piece of generated text (usually a few characters / one token or so)."""
 
@@ -142,7 +152,9 @@ class LLM(Protocol):
 
     def stream(self, history: list[HistoryMessage], tools: ToolExecutor | None = None) -> AsyncIterator[LLMEvent]: ...
 
-    async def generate_title(self, first_user_text: str) -> str | None: ...
+    async def generate_title(self, first_user_text: str) -> Generated | None: ...
+
+    async def summarize(self, previous_summary: str | None, messages: list[HistoryMessage]) -> Generated | None: ...
 
 
 # ── Error translation ────────────────────────────────────────────────────
@@ -292,6 +304,7 @@ class OpenAILLM:
         assert settings.openai_model, "validated at startup"
         self.model = settings.openai_model
         self._title_model = settings.title_model
+        self._summary_model = settings.summary_model
         self._instructions = settings.system_prompt
         self._max_output_tokens = settings.max_output_tokens
         self._max_attempts = settings.llm_max_attempts
@@ -487,7 +500,7 @@ class OpenAILLM:
                 with anyio.CancelScope(shield=True):
                     await stream.close()
 
-    async def generate_title(self, first_user_text: str) -> str | None:
+    async def generate_title(self, first_user_text: str) -> Generated | None:
         """A separate, tiny, non-streaming call whose only job is naming the chat.
 
         Kept apart from the main reply so a slow/failed title never delays or
@@ -510,7 +523,48 @@ class OpenAILLM:
         except (openai.OpenAIError, httpx2.TransportError) as exc:
             log.warning("title_generation_failed error_type=%s", type(exc).__name__)
             return None
-        return clean_title(response.output_text)
+        title = clean_title(response.output_text)
+        return Generated(title, parse_usage(getattr(response, "usage", None)), getattr(response, "model", None), self._title_model) if title else None
+
+    async def summarize(self, previous_summary: str | None, messages: list[HistoryMessage]) -> Generated | None:
+        """Fold `messages` into the running summary. One non-streaming call, made in the
+        background after a reply, so a slow or failed summary never touches a chat.
+        Returns None on any failure: the caller then simply keeps the old summary."""
+        transcript = "\n\n".join(
+            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:SUMMARY_MESSAGE_CHARS]}"
+            for m in messages
+        )
+        try:
+            response = await self._client.responses.create(
+                model=self._summary_model,
+                instructions=SUMMARY_INSTRUCTIONS,
+                input=f"Current summary:\n{previous_summary or '(none yet)'}\n\nNew messages to fold in:\n\n{transcript}",
+                # Generous: reasoning models spend output tokens thinking before the visible
+                # text, and a cap that is too tight leaves an empty summary.
+                max_output_tokens=SUMMARY_MAX_OUTPUT_TOKENS,
+                store=False,
+            )
+        except (openai.OpenAIError, httpx2.TransportError) as exc:
+            log.warning("summary_generation_failed error_type=%s", type(exc).__name__)
+            return None
+        text = (response.output_text or "").strip()
+        if not text or getattr(response, "status", "completed") != "completed":
+            log.warning("summary_generation_unusable status=%s empty=%s", getattr(response, "status", None), not text)
+            return None
+        return Generated(text, parse_usage(getattr(response, "usage", None)), getattr(response, "model", None), self._summary_model)
+
+
+SUMMARY_MESSAGE_CHARS = 4000  # one huge paste must not make the summary call huge
+SUMMARY_MAX_OUTPUT_TOKENS = 1500
+SUMMARY_INSTRUCTIONS = (
+    "You maintain the running memory of a chat between a user and an assistant. Update the "
+    "current summary with the new messages and reply with the updated summary only. "
+    "Keep everything that could matter later: the user's name and facts about them, their goals "
+    "and preferences, decisions made, names of files, functions and projects, key numbers and "
+    "URLs, code that was agreed on (describe it briefly), and open questions or TODOs. "
+    "Drop small talk and anything already superseded. Write compact bullet points, under 300 words. "
+    "Never invent details."
+)
 
 
 def _output_items(response: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
