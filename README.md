@@ -7,6 +7,8 @@ User → React → HTTP POST → FastAPI → conversation history (SQLite)
      → OpenAI Responses API (streaming) → deltas → FastAPI → SSE → React → tokens appear
 ```
 
+> **New here?** [`docs/`](docs/index.html) is an interactive guide to how this app works: 17 lessons covering the architecture, every generative-AI idea in it and the real code, with examples that run in your browser. Open `docs/index.html` (or see [`docs/README.md`](docs/README.md)).
+
 ## Contents
 
 1. [Why this project exists](#why-this-project-exists)

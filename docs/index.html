@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Streambot Guide: how a production-style LLM app really works</title>
+  <meta name="description" content="A complete interactive tutorial on Streambot: streaming, tool calling, web search with citations, rolling memory, prompt caching and cost tracking, with real code from the app.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230a1218'/%3E%3Cpath d='M9 11l6 5-6 5' stroke='%2322d3ee' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3Crect x='17.5' y='19.5' width='6' height='2.4' rx='1.2' fill='%2322d3ee'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="shared/vendor/cm/codemirror.min.css">
+  <link rel="stylesheet" href="shared/vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="shared/css/style.css">
+  <style>
+    /* Streambot colours: cyan on near-black, like the app itself */
+    :root { --accent: #0891b2; --accent-2: #0e7490; --accent-3: #f59e0b; }
+    :root[data-theme="dark"] { --accent: #22d3ee; --accent-2: #67e8f9; --accent-3: #fbbf24; }
+  </style>
+  <script>
+    (function () {
+      var t;
+      try { t = localStorage.getItem("techcontent:theme"); } catch (e) {}
+      if (!t) t = window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", t);
+    })();
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <button class="icon-btn menu-btn" id="menu-btn" aria-label="Open navigation" data-icon="menu"></button>
+    <a class="brand" href="#/"><span class="brand-logo">&gt;_</span><span class="brand-text">Streambot Guide<small>how it works, in depth</small></span></a>
+    <button class="search-trigger" id="search-btn" aria-label="Search lessons" data-icon="search"><span>Search lessons, terms…</span><kbd>Ctrl K</kbd></button>
+    <nav class="topnav">
+      <a href="#/" data-nav="home" data-icon="home"><span>Home</span></a>
+      <a href="#/m/start-here" data-nav="learn" data-icon="cap"><span>Learn</span></a>
+      <a href="#/glossary" data-nav="glossary" data-icon="book"><span>Glossary</span></a>
+    </nav>
+    <span class="runtime-pill" id="runtime-pill" data-state="idle"><span class="dot"></span><span class="rt-label">idle</span></span>
+    <button class="icon-btn" id="theme-btn" aria-label="Toggle theme"></button>
+  </header>
+
+  <div class="layout" id="layout">
+    <aside class="sidebar" id="sidebar" aria-label="Course navigation"></aside>
+    <div class="scrim" id="scrim"></div>
+    <main class="main" id="main"></main>
+  </div>
+
+  <div class="palette-backdrop" id="palette" role="dialog" aria-modal="true" aria-label="Search">
+    <div class="palette">
+      <div class="palette-input"><svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg><input id="palette-q" placeholder="Search lessons and definitions…" autocomplete="off" spellcheck="false"><kbd>Esc</kbd></div>
+      <div class="palette-results" id="palette-results"></div>
+      <div class="palette-foot"><span><kbd>↑</kbd> <kbd>↓</kbd> to move</span><span><kbd>Enter</kbd> to open</span><span><kbd>/</kbd> or <kbd>Ctrl K</kbd> anywhere</span></div>
+    </div>
+  </div>
+  <div class="toast" id="toast" role="status"></div>
+
+  <script src="shared/vendor/marked.min.js"></script>
+  <script src="shared/vendor/katex/katex.min.js"></script>
+  <script src="shared/vendor/cm/codemirror.min.js"></script>
+  <script src="shared/vendor/cm/mode/python.min.js"></script>
+  <script src="shared/vendor/cm/mode/javascript.min.js"></script>
+  <script src="shared/vendor/cm/mode/jsx.min.js"></script>
+  <script src="shared/vendor/cm/mode/shell.min.js"></script>
+  <script src="shared/vendor/cm/mode/css.min.js"></script>
+  <script src="shared/vendor/cm/mode/xml.min.js"></script>
+  <script src="shared/vendor/cm/mode/htmlmixed.min.js"></script>
+  <script src="shared/vendor/cm/addon/runmode.min.js"></script>
+  <script src="shared/vendor/cm/addon/matchbrackets.min.js"></script>
+  <script src="shared/vendor/cm/addon/closebrackets.min.js"></script>
+  <script src="shared/vendor/cm/addon/comment.min.js"></script>
+  <script>
+    window.SITE = {
+      name: "Streambot Guide",
+      storageKey: "streambot-guide",
+      langName: "Python",
+      heroStatus: "✓ code quoted from the real app",
+      glossaryHint: "Filter terms… (e.g. SSE, token, tool calling, prompt caching)",
+      tagline: "how it works, in depth",
+      badge: "2026",
+      eyebrow: "streaming → history → memory → tools → citations → cost → caching",
+      heroTitle: 'How a <span class="grad">production-style LLM app</span> really works.',
+      heroSub: "Streambot is a ChatGPT-style app built from scratch: FastAPI, the OpenAI Responses API, Server-Sent Events, SQLite and React. This guide explains every layer and every generative-AI idea in it, in plain English first, then with the real code. Nothing is hand-waved: the code you read is pulled straight from the repository at build time.",
+      heroNote: "Examples marked ▶ Run are real functions from the app, running in your browser. Nothing to install.",
+      pathGoal: "the whole app",
+      runTitle: "Try it yourself",
+      localHint: "Run this on your computer (needs the app's backend or an API key)",
+      tocTip: "Python examples marked ▶ Run are editable and run right here. They are the app's own functions: change the inputs and watch what happens.",
+      footer: "Built for learning. Python runs in your browser with Pyodide. Nothing you type is sent anywhere.",
+      levelLabels: { easy: "Beginner" },
+      stats: (i) => [
+        { n: i.lessons, label: "in-depth lessons" },
+        { n: i.runnable + "+", label: "real functions you can run" },
+        { n: i.definitions, label: "concepts defined" },
+        { n: i.modules, label: "parts, one layer at a time" },
+      ],
+      features: [
+        { icon: "layers", title: "One layer at a time", text: "Architecture first, then the model layer, streaming, storage, memory, tools, cost and the React client. Every layer has one job." },
+        { icon: "check", title: "The real code", text: "Every code block is extracted from the repository when this guide is built, by function name. If the app changes, the guide cannot silently go stale." },
+        { icon: "play", title: "Run the app's own functions", text: "Token budgeting, summary planning, cost and cache-savings maths, SSE formatting: run and edit them in the browser." },
+        { icon: "target", title: "Every GenAI concept, named", text: "Tokens, context windows, statelessness, streaming, tool calling, the agent loop, rolling summaries, prompt caching, and why each exists." },
+      ],
+      hero: {
+        file: "app/chat/sse.py",
+        lang: "python",
+        code: `# One streamed word, as it travels from server to browser.
+def sse(event: str, data: dict) -> str:
+    return f"event: {event}\\ndata: {json.dumps(data)}\\n\\n"
+
+yield sse("delta", {"text": "Hello"})`,
+        output: `event: delta
+data: {"text": "Hello"}
+`,
+      },
+    };
+  </script>
+  <script src="assets/js/content.js"></script>
+  <script src="assets/js/runner-python.js"></script>
+  <script src="shared/js/app.js"></script>
+</body>
+</html>
