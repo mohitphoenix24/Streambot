@@ -64,14 +64,33 @@ class CostBreakdown:
     cached_input_cost: float
     output_cost: float  # includes reasoning tokens (they are part of output_tokens)
     total_cost: float
+    # What the prompt cache saved: the cached tokens at the normal input rate minus what
+    # they actually cost. 0.0 when nothing was cached; None only if it cannot be known.
+    cache_savings: float | None = None
 
-    def as_dict(self) -> dict[str, float]:
+    def as_dict(self) -> dict[str, float | None]:
         return {
             "input_cost": self.input_cost,
             "cached_input_cost": self.cached_input_cost,
             "output_cost": self.output_cost,
             "total_cost": self.total_cost,
+            "cache_savings": self.cache_savings,
         }
+
+
+def cache_savings(price: ModelPrice, input_tokens: int, cached_input_tokens: int | None) -> float | None:
+    """Money the prompt cache saved on one call: cached x (input rate - cached rate) / 1M.
+
+    This is the difference between what those tokens WOULD have cost uncached and what
+    they cost. None if cached tokens were reported but the model has no cached price.
+    """
+    cached = min(cached_input_tokens or 0, input_tokens)
+    if cached == 0:
+        return 0.0
+    if price.cached_input_per_million is None:
+        return None
+    saved = Decimal(cached) * (Decimal(str(price.input_per_million)) - Decimal(str(price.cached_input_per_million))) / _PER
+    return float(max(saved, Decimal(0)))
 
 
 def calculate_cost(
@@ -102,6 +121,7 @@ def calculate_cost(
         cached_input_cost=float(cached_cost),
         output_cost=float(output_cost),
         total_cost=float(input_cost + cached_cost + output_cost),
+        cache_savings=cache_savings(price, input_tokens, cached_input_tokens),
     )
 
 
@@ -134,6 +154,17 @@ class PriceTable:
         ):
             return requested_model
         return None
+
+    def cache_savings_for(
+        self, requested_model: str | None, served_model: str | None,
+        input_tokens: int | None, cached_input_tokens: int | None,
+    ) -> float | None:
+        """Cache savings for stored usage numbers (used when reading rows back)."""
+        if input_tokens is None:
+            return None
+        key = self.resolve(requested_model, served_model)
+        price = self.get(key)
+        return cache_savings(price, input_tokens, cached_input_tokens) if price else None
 
     def calculate_cost(
         self,

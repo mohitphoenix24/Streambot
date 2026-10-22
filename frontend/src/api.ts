@@ -10,6 +10,7 @@ import type {
   TitleEvent,
   ToolCallEvent,
   ToolResultEvent,
+  UsageReport,
 } from "./types";
 
 // The browser only ever talks to OUR backend. There is no OpenAI key (or any
@@ -63,6 +64,9 @@ export interface Info {
   web_search_available: boolean;
 }
 export const getInfo = () => json<Info>("/info");
+/** `utcOffsetMinutes` (east positive) makes the backend bucket days on the user's clock. */
+export const getUsage = (days: number, utcOffsetMinutes: number) =>
+  json<UsageReport>(`/usage?days=${days}&utc_offset_minutes=${utcOffsetMinutes}`);
 
 /**
  * Send a message and consume the SSE reply stream.

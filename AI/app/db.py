@@ -259,6 +259,29 @@ class Database:
                 ).fetchall()
         return [dict(r) for r in rows]
 
+    def usage_rows(self, since_iso: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Everything that cost (or may have cost) money since `since_iso` (UTC, same ISO
+        format we store): assistant replies that reported usage, and title/summary calls.
+        Replies carry the conversation title (None if the chat was deleted since)."""
+        with self.connect() as conn:
+            replies = conn.execute(
+                "SELECT m.id, m.conversation_id, c.title AS conversation_title, m.model, m.served_model, "
+                "       m.input_tokens, m.cached_input_tokens, m.output_tokens, m.reasoning_tokens, "
+                "       m.total_tokens, m.cost_usd, m.web_searches, m.created_at "
+                "FROM messages m LEFT JOIN conversations c ON c.id = m.conversation_id "
+                "WHERE m.role = 'assistant' AND m.created_at >= ? "
+                "  AND (m.total_tokens IS NOT NULL OR m.cost_usd IS NOT NULL) "
+                "ORDER BY m.created_at",
+                (since_iso,),
+            ).fetchall()
+            calls = conn.execute(
+                "SELECT id, conversation_id, purpose, model, served_model, input_tokens, cached_input_tokens, "
+                "       output_tokens, reasoning_tokens, total_tokens, cost_usd, created_at "
+                "FROM llm_calls WHERE created_at >= ? ORDER BY created_at",
+                (since_iso,),
+            ).fetchall()
+        return [dict(r) for r in replies], [dict(r) for r in calls]
+
     def set_title(self, conversation_id: str, title: str) -> None:
         with self.connect() as conn:
             conn.execute(

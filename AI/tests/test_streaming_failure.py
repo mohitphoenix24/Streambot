@@ -189,7 +189,7 @@ async def test_task_cancellation_while_waiting_for_the_model_saves_partial(db, s
     gate = asyncio.Event()
 
     class StallingLLM(ScriptedLLM):
-        async def stream(self, history):
+        async def stream(self, history, tools=None, cache_key=None):
             try:
                 yield TextDelta("partial ")
                 await asyncio.sleep(3600)  # model stalls
@@ -223,7 +223,7 @@ async def test_partial_text_is_checkpointed_to_the_database_while_streaming(db, 
     snapshots = []
 
     class SnapshotLLM(ScriptedLLM):
-        async def stream(self, history):
+        async def stream(self, history, tools=None, cache_key=None):
             yield TextDelta("alpha ")
             yield TextDelta("beta ")
             # by now the first delta must already have been flushed (interval=0)

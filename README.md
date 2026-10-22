@@ -105,6 +105,7 @@ Streaming-Chat-App/
 │   │   │   ├── streaming.py  begin_turn() + stream_reply(): THE pipeline
 │   │   │   ├── history.py    approx_tokens(), build_history() (budgeted, summary-aware)
 │   │   │   ├── memory.py     plan_summary() + MemoryManager: the rolling summary
+│   │   │   ├── usage_report.py  build_usage_report(): the numbers behind the Usage page
 │   │   │   └── sse.py        sse(event, data) wire formatter
 │   │   ├── llm/
 │   │   │   ├── client.py     OpenAI Responses API: stream(), retry, error mapping, titles
@@ -128,6 +129,8 @@ Streaming-Chat-App/
 │   ├── sse.ts            incremental SSE parser (buffering) + sse.test.ts
 │   ├── Chat.tsx          conversation state machine, Stop/AbortController
 │   ├── Message.tsx       plain text while streaming → sanitized Markdown after
+│   ├── Usage.tsx         the Usage page: spend, tokens, cache hit rate, savings (hand-drawn SVG/CSS charts)
+│   ├── chart.ts          pure chart helpers (nice axis, ticks, labels) + chart.test.ts
 │   ├── App.tsx           sidebar, URL-hash routing
 │   └── styles.css
 ├── run.sh                launcher: backend + frontend
@@ -283,7 +286,8 @@ A row never leaves `complete`/`error`/`cancelled`. History building skips `error
 | `GET /conversations/{id}` | `{id,title,messages:[…],total_cost_usd,total_tokens,unpriced_messages}` |
 | `POST /conversations/{id}/messages` | body `{"text":"…"}` → **SSE stream** (what the UI uses) |
 | `POST /conversations/{id}/messages/sync` | same, **non-streaming** JSON (teaching baseline; try it with `curl`) |
-| `GET /info` | `{model, usd_to_inr, usd_to_inr_source, usd_to_inr_as_of}` |
+| `GET /info` | `{model, usd_to_inr, usd_to_inr_source, usd_to_inr_as_of, web_search_available}` |
+| `GET /usage?days=30&utc_offset_minutes=330` | spend, tokens, cache hit rate and savings, daily series, by purpose / model, top chats (days follow the caller's clock) |
 
 Errors before streaming starts are plain HTTP: `404` unknown conversation · `422` empty text · `413` too large · `409` a reply is already streaming in this conversation · `429` rate limited (with `Retry-After`).
 
@@ -342,7 +346,7 @@ data: {"text": "Hello"}
 |---|---|---|
 | `start` | `user_message_id, assistant_message_id, history_messages, history_truncated, history_summarized` | swap temp ids for real ids; show the summarized/truncation note |
 | `delta` | `{text}` | append text immediately |
-| `done` | `stop_reason, usage{input,cached_input,output,reasoning,total}, cost{input_cost,cached_input_cost,output_cost,total_cost}, requested_model, served_model, ttft_ms, latency_ms, web_searches, conversation_total_*` (usage/cost are `null` when unavailable) | stop loading/Stop button, show tokens + cost, render Markdown |
+| `done` | `stop_reason, usage{input,cached_input,output,reasoning,total}, cost{input_cost,cached_input_cost,output_cost,total_cost,cache_savings}, requested_model, served_model, ttft_ms, latency_ms, web_searches, conversation_total_*` (usage/cost are `null` when unavailable) | stop loading/Stop button, show tokens + cost, render Markdown |
 | `error` | `{message, partial}` | keep partial text, show safe message |
 | `tool_call` | `{id, name, query}` | show "Searching the web for …" (the model asked for a search) |
 | `tool_result` | `{id, name, sources:[{n,title,url,snippet}], error}` | mark the search done; remember the sources for `[n]` citations |
@@ -443,6 +447,23 @@ What OpenAI reports, and how each field is stored:
 
 Also stored per reply: `model` (the **requested** model, from `OPENAI_MODEL`) and `served_model` (what OpenAI says it actually served, which may be a dated snapshot of the alias). The UI shows the served model.
 
+## Prompt caching
+
+OpenAI caches the **prefix** of a long prompt (1,024+ tokens) and bills the cached part at a fraction of the normal input rate. It only works for an *exact* repeated prefix, so the request is built to keep everything before the newest message stable:
+
+```
+static instructions → static tool definitions → rolling summary → append-only history → new message
+```
+
+- Nothing dynamic goes into the instructions (no timestamps), and the summary only changes when the boundary moves in a big step (see *Rolling-summary memory*).
+- Each reply request sends `prompt_cache_key = conversation id`, which routes a chat's requests to the same cache.
+- Verified against the real API: the same ~2,400-token prompt sent twice came back with 2,439 of 2,442 input tokens cached on the second call, and the call cost about 86% less.
+- **Savings** = `cached_tokens × (input_price − cached_input_price) / 1M`, i.e. what those tokens would have cost uncached minus what they cost. It is informational only (never subtracted again from the cost). It is shown per reply ("saved $…") and in total on the Usage page. It is `null` if cached tokens exist but the model has no cached price.
+
+## Usage page
+
+`#/usage` (sidebar link) shows the last 7 / 30 / 90 days: total spend (USD with INR), tokens, cache hit rate, money saved by caching, web searches, a daily-spend chart, spend by purpose (replies / chat titles / memory summaries), spend by model and the most expensive chats. Everything comes from stored rows: replies carry their own usage and cost, and title/summary calls are in `llm_calls`. A call with no configured price is counted as *unpriced* and the total is flagged as a lower bound, never counted as $0. Days follow the browser's clock (it sends its UTC offset). Deleting a chat removes its reply rows, so its reply spend leaves these totals; title and summary spend is kept.
+
 ## Cost accounting
 
 ```
@@ -535,6 +556,7 @@ cd frontend && npm run typecheck && npm test                   # TS typecheck + 
 | File | Covers |
 |---|---|
 | `test_history.py` | budget respected, newest preferred, errors/empty skipped, starts with user |
+| `test_usage_report.py` | the Usage page's numbers: totals, cache hit rate and savings, day bucketing in the user's timezone, deleted chats, unpriced calls |
 | `test_memory.py` | when to summarize (hysteresis), what history looks like with a summary, the background manager (merge, failure, concurrency, deleted chat) |
 | `test_pricing.py` | known/unknown model, calculation, TOML loading/validation, no invented prices |
 | `test_sse.py` | exact wire format, JSON payload, newline safety |

@@ -27,12 +27,14 @@ class ScriptedLLM:
         self.upstream_closed = False  # did the app close the provider stream?
         self.title_requests: list[str] = []
         self.tools_seen: list = []  # the ToolExecutor (or None) passed for each reply
+        self.cache_keys: list = []  # the prompt_cache_key passed for each reply
         self.summary_requests: list[tuple[str | None, list[HistoryMessage]]] = []  # (previous summary, folded messages)
         self.summary_text: str | None = "SCRIPTED SUMMARY"  # None = the summary call fails
 
-    async def stream(self, history: list[HistoryMessage], tools=None) -> AsyncIterator[LLMEvent]:
+    async def stream(self, history: list[HistoryMessage], tools=None, cache_key=None) -> AsyncIterator[LLMEvent]:
         self.histories.append(history)
         self.tools_seen.append(tools)
+        self.cache_keys.append(cache_key)
         try:
             for item in self.script:
                 if isinstance(item, Exception):

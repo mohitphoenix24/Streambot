@@ -23,7 +23,7 @@ from tests.helpers import ScriptedLLM
 class EndlessLLM(ScriptedLLM):
     """Streams a token every 20 ms for ~60 s unless the app stops listening."""
 
-    async def stream(self, history):
+    async def stream(self, history, tools=None, cache_key=None):
         import asyncio
 
         self.histories.append(history)

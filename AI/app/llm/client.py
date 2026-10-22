@@ -150,7 +150,9 @@ class LLM(Protocol):
 
     async def complete(self, history: list[HistoryMessage]) -> Completion: ...
 
-    def stream(self, history: list[HistoryMessage], tools: ToolExecutor | None = None) -> AsyncIterator[LLMEvent]: ...
+    def stream(
+        self, history: list[HistoryMessage], tools: ToolExecutor | None = None, cache_key: str | None = None
+    ) -> AsyncIterator[LLMEvent]: ...
 
     async def generate_title(self, first_user_text: str) -> Generated | None: ...
 
@@ -359,13 +361,18 @@ class OpenAILLM:
             served_model=getattr(response, "model", None),
         )
 
-    def stream(self, history: list[HistoryMessage], tools: ToolExecutor | None = None) -> AsyncIterator[LLMEvent]:
+    def stream(
+        self, history: list[HistoryMessage], tools: ToolExecutor | None = None, cache_key: str | None = None
+    ) -> AsyncIterator[LLMEvent]:
         """One reply as a stream of events. With `tools`, the model may call them in
-        a bounded loop (see _stream_agent); without, it is a single streamed call."""
-        return self._stream_agent(history, tools)
+        a loop (see _stream_agent); without, it is a single streamed call.
+
+        `cache_key` groups requests that share a prompt prefix (we pass the conversation
+        id) so OpenAI routes them to the same cache and a long chat keeps hitting it."""
+        return self._stream_agent(history, tools, cache_key)
 
     async def _stream_agent(
-        self, history: list[HistoryMessage], tools: ToolExecutor | None
+        self, history: list[HistoryMessage], tools: ToolExecutor | None, cache_key: str | None = None
     ) -> AsyncIterator[LLMEvent]:
         """The agent loop:  model -> (tool calls?) -> run tools -> model -> ... -> answer.
 
@@ -390,7 +397,7 @@ class OpenAILLM:
             end: _RoundEnd | None = None
             async with aclosing(
                 stream_with_retry(
-                    lambda: self._stream_once(input_items, tools),
+                    lambda: self._stream_once(input_items, tools, cache_key),
                     max_attempts=self._max_attempts,
                     base_delay=self._retry_base_delay,
                 )
@@ -423,7 +430,7 @@ class OpenAILLM:
                 )
 
     async def _stream_once(
-        self, input_items: list[dict[str, Any]], tools: ToolExecutor | None
+        self, input_items: list[dict[str, Any]], tools: ToolExecutor | None, cache_key: str | None = None
     ) -> AsyncIterator[LLMEvent | _RoundEnd]:
         """ONE attempt at ONE streaming request: same call, but `stream=True`.
 
@@ -437,7 +444,13 @@ class OpenAILLM:
         answer takes ten: it improves PERCEIVED latency (time to first token),
         not total generation time.
         """
+        # Prompt caching is automatic for long prompts, but only for an EXACT repeated
+        # prefix. Everything before the newest message is therefore kept stable: static
+        # instructions, then static tool definitions, then the summary (which changes
+        # rarely, see memory.py), then append-only history.
         extra: dict[str, Any] = {}
+        if cache_key:
+            extra["prompt_cache_key"] = cache_key
         instructions = self._instructions
         if tools is not None:
             instructions = f"{instructions}\n\n{tools.instructions}"

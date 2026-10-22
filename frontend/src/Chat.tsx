@@ -46,6 +46,7 @@ const tempMessage = (role: "user" | "assistant", content: string): ViewMessage =
   latency_ms: null,
   sources: [],
   web_searches: null,
+  cache_savings_usd: null,
   created_at: new Date().toISOString(),
 });
 
@@ -254,6 +255,7 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
               ttft_ms: e.ttft_ms,
               latency_ms: e.latency_ms,
               web_searches: e.web_searches || null,
+              cache_savings_usd: e.cost?.cache_savings ?? null,
             }));
             setTotals({
               cost: e.conversation_total_cost_usd,

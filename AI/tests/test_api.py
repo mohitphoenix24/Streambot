@@ -373,3 +373,44 @@ def test_a_failing_summary_never_breaks_the_chat(make_client, settings):
         assert send(client, cid, f"question {i} " + "q" * 80).status_code == 200
     reply = client.get(f"/conversations/{cid}").json()["messages"][-1]
     assert reply["status"] == "complete"  # truncation kept the prompt bounded
+
+
+# ── caching + usage endpoint ─────────────────────────────────────────────
+def test_the_conversation_id_is_the_prompt_cache_key(make_client):
+    llm = ScriptedLLM(ok_script("x"))
+    client = make_client(llm)
+    cid = new_conversation(client)
+    send(client, cid, "a")
+    send(client, cid, "b")
+    assert llm.cache_keys == [cid, cid]  # every turn of a chat shares one key
+
+
+def test_cached_tokens_show_up_as_savings_on_the_reply(make_client, settings):
+    from app.llm.usage import Usage
+
+    prices = settings.prices_path
+    prices.write_text('[models."test-model"]\ninput = 1.0\ncached_input = 0.1\noutput = 4.0\n')
+    llm = ScriptedLLM(ok_script("x", usage=Usage(1_000_000, 0, 1_000_000, cached_input_tokens=500_000)))
+    client = make_client(llm)
+    cid = new_conversation(client)
+
+    done = dict(parse_sse(send(client, cid).text))["done"]
+    assert done["cost"]["cache_savings"] == pytest.approx(0.45)  # 500k x ($1.00 - $0.10)
+    reply = client.get(f"/conversations/{cid}").json()["messages"][-1]
+    assert reply["cache_savings_usd"] == pytest.approx(0.45)  # still there after a reload
+
+
+def test_usage_endpoint_reports_replies_and_titles(make_client):
+    client = make_client(ScriptedLLM(ok_script("x"), title="T"))
+    cid = new_conversation(client)
+    send(client, cid, "hello")
+
+    body = client.get("/usage?days=7").json()
+    assert body["days"] == 7 and len(body["daily"]) == 7
+    assert body["totals"]["replies"] == 1 and body["totals"]["calls"] == 2  # the reply + its title call
+    assert [p["purpose"] for p in body["by_purpose"]] == ["reply", "title", "summary"]
+
+
+@pytest.mark.parametrize("query", ["days=0", "days=400", "utc_offset_minutes=9999", "days=abc"])
+def test_usage_endpoint_validates_its_parameters(make_client, query):
+    assert make_client().get(f"/usage?{query}").status_code == 422

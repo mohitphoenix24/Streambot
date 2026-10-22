@@ -442,3 +442,37 @@ async def test_title_call_now_reports_its_usage(llm_factory):
     response = NS(output_text="A Title", model="snap", usage=NS(input_tokens=20, output_tokens=5, total_tokens=25))
     title = await llm_factory(client_with(response)).generate_title("hi")
     assert title.text == "A Title" and title.usage.total_tokens == 25 and title.served_model == "snap"
+
+
+# ── prompt caching ───────────────────────────────────────────────────────
+async def test_the_cache_key_is_sent_when_given_and_omitted_otherwise(llm_factory):
+    client = client_with(StubStream([delta("a"), completed()]), StubStream([delta("b"), completed()]))
+    llm = llm_factory(client)
+    async for _ in llm.stream([{"role": "user", "content": "hi"}], cache_key="conv-123"):
+        pass
+    async for _ in llm.stream([{"role": "user", "content": "hi"}]):
+        pass
+    with_key, without = client.responses.calls
+    assert with_key["prompt_cache_key"] == "conv-123" and "prompt_cache_key" not in without
+
+
+async def test_the_cache_key_is_sent_on_every_round_of_a_tool_using_reply(llm_factory):
+    client = client_with(StubStream([round_end(fn_call())]), StubStream([delta("x"), round_end()]))
+    async for _ in llm_factory(client).stream([{"role": "user", "content": "hi"}], FakeTools(), cache_key="conv-9"):
+        pass
+    assert [c["prompt_cache_key"] for c in client.responses.calls] == ["conv-9", "conv-9"]
+
+
+async def test_the_prompt_prefix_is_identical_between_turns(llm_factory):
+    """Caching needs an EXACT repeated prefix: turn 2's request must start with turn 1's."""
+    client = client_with(StubStream([delta("a"), completed()]), StubStream([delta("b"), completed()]))
+    llm = llm_factory(client)
+    turn1 = [{"role": "user", "content": "q1"}]
+    turn2 = turn1 + [{"role": "assistant", "content": "a1"}, {"role": "user", "content": "q2"}]
+    async for _ in llm.stream(turn1, cache_key="c"):
+        pass
+    async for _ in llm.stream(turn2, cache_key="c"):
+        pass
+    one, two = client.responses.calls
+    assert one["instructions"] == two["instructions"]  # nothing dynamic (no timestamps) in the system prompt
+    assert two["input"][: len(one["input"])] == one["input"]

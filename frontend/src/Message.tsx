@@ -272,6 +272,11 @@ function Stats({ message }: { message: ViewMessage }) {
           <span title={`USD calculated from the reported usage and AI/data/prices.toml. ${describeRate(rateInfo)}`}>
             <b>{formatMoney(message.cost_usd, rate)}</b>
           </span>
+          {message.cache_savings_usd ? (
+            <span className="saved" title="What the prompt cache saved on this reply: cached tokens at the normal input rate minus what they cost">
+              saved <b>{formatMoney(message.cache_savings_usd, rate)}</b>
+            </span>
+          ) : null}
           {message.web_searches ? (
             <span title="Web searches the model ran for this reply">
               <b>{message.web_searches}</b> web {message.web_searches === 1 ? "search" : "searches"}

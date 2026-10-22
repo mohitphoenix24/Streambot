@@ -34,6 +34,8 @@ export interface Message {
   latency_ms: number | null;
   sources: Source[];
   web_searches: number | null;
+  /** What the prompt cache saved on this reply (USD); null = unknown. */
+  cache_savings_usd: number | null;
   created_at: string;
 }
 
@@ -69,6 +71,7 @@ export interface CostBreakdown {
   cached_input_cost: number;
   output_cost: number; // includes reasoning tokens
   total_cost: number;
+  cache_savings: number | null; // what cached tokens saved vs. the normal input rate
 }
 
 // The payloads of the SSE events the server emits (see AI/app/chat/streaming.py).
@@ -125,4 +128,27 @@ export interface StreamHandlers {
   onDone?: (e: DoneEvent) => void;
   onError?: (e: ErrorEvent) => void;
   onTitle?: (e: TitleEvent) => void;
+}
+
+// GET /usage: everything the Usage page shows, computed by the backend from stored rows.
+export interface UsageReport {
+  days: number;
+  from: string;
+  to: string;
+  totals: {
+    cost_usd: number;
+    unpriced_calls: number; // calls with usage but no price: cost_usd is a lower bound
+    calls: number;
+    replies: number;
+    input_tokens: number;
+    cached_input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+    web_searches: number;
+  };
+  cache: { hit_rate: number | null; cached_input_tokens: number; savings_usd: number | null };
+  by_purpose: { purpose: "reply" | "title" | "summary"; calls: number; cost_usd: number; total_tokens: number }[];
+  by_model: { model: string; calls: number; cost_usd: number; total_tokens: number }[];
+  daily: { date: string; cost_usd: number; total_tokens: number; replies: number }[];
+  top_conversations: { id: string; title: string; cost_usd: number; replies: number }[];
 }

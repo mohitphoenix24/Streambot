@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, deleteConversation, listConversations } from "./api";
 import Chat from "./Chat";
-import { CheckIcon, LogoMark, MenuIcon, PlusIcon, SearchIcon, TrashIcon } from "./Icons";
+import { ChartIcon, CheckIcon, LogoMark, MenuIcon, PlusIcon, SearchIcon, TrashIcon } from "./Icons";
 import { RateProvider } from "./rate";
+import Usage from "./Usage";
 import type { Conversation } from "./types";
 
 // The selected conversation lives in the URL hash (#/c/<id>), so a page refresh,
 // a bookmark, and the back button all land on the same conversation. The
 // conversation CONTENT comes from the database via the API.
 const idFromHash = () => /^#\/c\/(.+)$/.exec(window.location.hash)?.[1] ?? null;
+const onUsagePage = () => window.location.hash === "#/usage";
 
 // Opening the app in a new tab or window always starts a NEW chat, like ChatGPT, even if the
 // address still carries an old #/c/<id>. A refresh inside the same tab keeps its chat:
@@ -48,6 +50,7 @@ export default function App() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [listState, setListState] = useState<"loading" | "ready" | "error">("loading");
   const [selectedId, setSelectedId] = useState<string | null>(idFromHash);
+  const [usageOpen, setUsageOpen] = useState(onUsagePage);
   const [sidebarOpen, setSidebarOpen] = useState(false); // only matters on narrow screens
   // Remounts Chat when it changes. A draft chat that gets saved keeps its key, so the
   // reply that is streaming into it is not interrupted when the URL gains an id.
@@ -75,6 +78,7 @@ export default function App() {
     const onHash = () => {
       const id = idFromHash();
       setSelectedId(id);
+      setUsageOpen(onUsagePage());
       if (id !== null && id === savedDraftId.current) {
         savedDraftId.current = null; // the URL just caught up with a draft that was saved
         return;
@@ -233,11 +237,25 @@ export default function App() {
               </section>
             ))}
           </nav>
+          <button
+            className={`nav-link ${usageOpen ? "active" : ""}`}
+            onClick={() => {
+              window.location.hash = "/usage";
+              setSidebarOpen(false);
+            }}
+            aria-current={usageOpen ? "page" : undefined}
+          >
+            <ChartIcon /> Usage
+          </button>
         </aside>
 
         <main className="main">
           {/* key => a fresh Chat (fresh state, aborted stream) per conversation or new draft */}
-          <Chat key={chatKey} conversationId={selectedId} onCreated={onCreated} onTitle={onTitle} onActivity={onActivity} />
+          {usageOpen ? (
+            <Usage />
+          ) : (
+            <Chat key={chatKey} conversationId={selectedId} onCreated={onCreated} onTitle={onTitle} onActivity={onActivity} />
+          )}
         </main>
       </div>
     </RateProvider>

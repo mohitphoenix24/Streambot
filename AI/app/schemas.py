@@ -45,6 +45,7 @@ class MessageOut(BaseModel):
     latency_ms: float | None = None
     sources: list[SourceOut] = []
     web_searches: int | None = None
+    cache_savings_usd: float | None = None  # what the prompt cache saved on this reply; None = unknown
     created_at: str
 
     @field_validator("sources", mode="before")

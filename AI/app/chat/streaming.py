@@ -196,7 +196,7 @@ async def stream_reply(
         # aclosing() guarantees the upstream stream is closed when we leave this
         # block early, which closes the HTTP connection to OpenAI so it stops
         # generating (and billing) tokens nobody is reading.
-        upstream = llm.stream(turn.history, tools) if tools is not None else llm.stream(turn.history)
+        upstream = llm.stream(turn.history, tools, cache_key=conversation_id)
         async with aclosing(upstream) as events:
             async for event in events:
                 # CANCELLATION, signal 1: ask the server whether the browser is

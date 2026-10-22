@@ -103,3 +103,34 @@ def test_shipped_prices_have_the_configured_models_and_no_invented_ones():
     table = PriceTable.load(DATA_DIR / "prices.toml")
     assert table.get("gpt-5.6-luna") == ModelPrice(0.20, 1.20, 0.02)
     assert table.get("gpt-4o") is None  # nothing we weren't given
+
+
+# ── what the prompt cache saved ──────────────────────────────────────────
+from app.llm.pricing import cache_savings  # noqa: E402
+
+
+def test_cache_savings_is_cached_tokens_times_the_rate_difference():
+    price = ModelPrice(input_per_million=2.0, output_per_million=8.0, cached_input_per_million=0.5)
+    # 1,000,000 cached tokens x ($2.00 - $0.50) = $1.50
+    assert cache_savings(price, 2_000_000, 1_000_000) == pytest.approx(1.5)
+
+
+def test_no_cached_tokens_means_zero_savings_even_without_a_cached_price():
+    assert cache_savings(ModelPrice(2.0, 8.0), 1000, 0) == 0.0
+    assert cache_savings(ModelPrice(2.0, 8.0), 1000, None) == 0.0
+
+
+def test_savings_are_unknown_when_cached_tokens_have_no_cached_price():
+    assert cache_savings(ModelPrice(2.0, 8.0), 1000, 400) is None
+
+
+def test_savings_never_exceed_what_was_actually_cached():
+    price = ModelPrice(1.0, 4.0, 0.1)
+    assert cache_savings(price, 100, 5000) == cache_savings(price, 100, 100)  # clamped like the cost is
+
+
+def test_cost_breakdown_carries_the_savings():
+    price = ModelPrice(1.0, 4.0, 0.1)
+    cost = calculate_cost(price, input_tokens=1_000_000, cached_input_tokens=400_000, output_tokens=0)
+    assert cost.cache_savings == pytest.approx(0.36) and cost.as_dict()["cache_savings"] == pytest.approx(0.36)
+    assert cost.total_cost == pytest.approx(0.6 * 1.0 + 0.4 * 0.1)  # savings are informational, never double-subtracted

@@ -21,7 +21,7 @@ import math
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
@@ -36,6 +36,7 @@ from app.tools.registry import ToolRunner
 from app.tools.web_search import TavilySearch
 from app.chat.memory import MemoryManager
 from app.chat.streaming import begin_turn, finalize_complete, stream_reply
+from app.chat.usage_report import build_usage_report
 
 log = logging.getLogger("chat.app")
 
@@ -152,6 +153,11 @@ def create_app(
     async def list_conversations() -> list[dict]:
         return db.list_conversations()
 
+    def to_message_out(m: dict) -> MessageOut:
+        """A stored row as the API shape, plus what the prompt cache saved (needs the price table)."""
+        saved = prices.cache_savings_for(m["model"], m["served_model"], m["input_tokens"], m["cached_input_tokens"])
+        return MessageOut(**m, cache_savings_usd=saved)
+
     @app.get("/conversations/{conversation_id}", response_model=ConversationDetail)
     async def get_conversation(conversation_id: str) -> ConversationDetail:
         conv = db.get_conversation(conversation_id)
@@ -159,7 +165,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Conversation not found")
         return ConversationDetail(
             **conv,
-            messages=[MessageOut(**m) for m in db.list_messages(conversation_id)],
+            messages=[to_message_out(m) for m in db.list_messages(conversation_id)],
             **db.conversation_totals(conversation_id),
         )
 
@@ -239,6 +245,15 @@ def create_app(
         )
         db.touch_conversation(conversation_id)
         return db.get_message(assistant_id)
+
+    @app.get("/usage")
+    async def usage(
+        days: int = Query(30, ge=1, le=365),
+        utc_offset_minutes: int = Query(0, ge=-840, le=840),
+    ) -> dict:
+        """Spend, tokens, cache hit rate and savings for the Usage page. Days are the
+        caller's days: the browser passes its own UTC offset (east positive)."""
+        return build_usage_report(db, prices, days=days, utc_offset_minutes=utc_offset_minutes)
 
     @app.get("/info")
     async def info(request: Request) -> dict[str, str | float | bool | None]:
