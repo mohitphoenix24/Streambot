@@ -13,7 +13,6 @@ from types import SimpleNamespace as NS
 import pytest
 
 from app.config import BASE_DIR, DATA_DIR, Settings
-from app.db import Database
 from app.llm.client import Completed, LLMError, OpenAILLM, TextDelta
 from app.llm.pricing import PriceTable
 from app.chat.streaming import begin_turn, stream_reply
@@ -222,8 +221,7 @@ def test_error_before_any_token_also_has_null_usage(make_client):
     assert row["status"] == "error" and row["total_tokens"] is None and row["cost_usd"] is None
 
 
-async def test_cancelled_reply_without_reported_usage_stores_null(settings):
-    db = Database(settings.database_path); db.init_schema()
+async def test_cancelled_reply_without_reported_usage_stores_null(settings, db):
     llm = ScriptedLLM(ok_script("a ", "b ", "c "))
     cid = db.create_conversation()["id"]
     turn = begin_turn(db, llm, settings, cid, "q")
@@ -234,10 +232,9 @@ async def test_cancelled_reply_without_reported_usage_stores_null(settings):
     assert row["total_tokens"] is None and row["cost_usd"] is None  # never invented
 
 
-async def test_cancelled_reply_keeps_usage_if_the_provider_had_reported_it(settings, tmp_path):
+async def test_cancelled_reply_keeps_usage_if_the_provider_had_reported_it(settings, db, tmp_path):
     prices_file = tmp_path / "p.toml"
     prices_file.write_text('[models."gpt-5.6-luna"]\ninput = 0.20\ncached_input = 0.02\noutput = 1.20\n')
-    db = Database(settings.database_path); db.init_schema()
     usage = Usage(1000, 300, 1300, cached_input_tokens=200)
     # final event arrives, then the client disconnects before the stream fully closes
     llm = ScriptedLLM([TextDelta("hi"), Completed("completed", usage, MODEL), TextDelta("late")], model=MODEL)
@@ -314,29 +311,3 @@ def test_done_event_carries_running_conversation_totals(luna_client):
     done = dict(parse_sse(body))["done"]
     assert (done["conversation_total_input_tokens"], done["conversation_total_output_tokens"],
             done["conversation_total_tokens"]) == (1100, 350, 1450)
-
-
-# ── database migration for databases created before these columns existed ──
-def test_old_database_files_are_migrated_in_place(tmp_path):
-    import sqlite3
-
-    path = tmp_path / "old.db"
-    conn = sqlite3.connect(path)
-    conn.executescript("""
-        CREATE TABLE conversations(id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-        CREATE TABLE messages(id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
-            content TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER,
-            total_tokens INTEGER, cost_usd REAL, stop_reason TEXT, model TEXT, ttft_ms REAL, latency_ms REAL,
-            history_truncated INTEGER, created_at TEXT NOT NULL);
-        INSERT INTO conversations VALUES ('c','t','x','x');
-        INSERT INTO messages(id,conversation_id,role,content,status,input_tokens,output_tokens,total_tokens,created_at)
-            VALUES ('m','c','assistant','old reply','complete',5,6,11,'x');""")
-    conn.commit(); conn.close()
-
-    db = Database(path)
-    db.init_schema(); db.init_schema()  # idempotent
-    row = db.get_message("m")
-    assert (row["content"], row["total_tokens"]) == ("old reply", 11)  # old data intact
-    assert row["cached_input_tokens"] is None and row["served_model"] is None  # new columns exist, NULL
-    db.update_message("m", cached_input_tokens=3, reasoning_tokens=2, served_model="x")
-    assert db.get_message("m")["reasoning_tokens"] == 2

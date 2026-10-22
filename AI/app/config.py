@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parents[1]  # the AI/ directory
 REPO_ROOT = BASE_DIR.parent
-DATA_DIR = BASE_DIR / "data"  # SQLite file and the price table
+DATA_DIR = BASE_DIR / "data"  # the price table
 
 # Values copied verbatim from .env.example. If one of these is still in place,
 # the user forgot to edit the file; say so instead of sending it to OpenAI.
@@ -70,7 +70,8 @@ class Settings:
     retry_base_delay_s: float = 0.5
     partial_flush_interval_s: float = 1.0
 
-    database_path: Path = DATA_DIR / "chat.db"
+    database_url: str = "postgresql://streambot:streambot@localhost:5440/streambot"
+    db_pool_max: int = 10
     prices_path: Path = DATA_DIR / "prices.toml"
     # Exact allowed browser origins. Empty (the default) means "dev mode": allow the
     # React dev server on ANY localhost port, because Vite silently moves to
@@ -95,6 +96,11 @@ class Settings:
     def validate(self) -> None:
         """Fail fast with an actionable message. Called once at server startup."""
         problems: list[str] = []
+        if not self.database_url.startswith(("postgresql://", "postgres://")):
+            problems.append(
+                "DATABASE_URL must be a PostgreSQL URL like postgresql://user:password@localhost:5440/streambot "
+                "(start the database with `docker compose up -d postgres`)."
+            )
         if (self.openai_api_key or "").strip().lower() in _PLACEHOLDERS:
             problems.append(
                 "OPENAI_API_KEY is missing or still the placeholder. "
@@ -163,7 +169,8 @@ class Settings:
             llm_max_attempts=number("LLM_MAX_ATTEMPTS", 2, integer=True, minimum=1),
             retry_base_delay_s=number("RETRY_BASE_DELAY_S", 0.5),
             partial_flush_interval_s=number("PARTIAL_FLUSH_INTERVAL_S", 1.0),
-            database_path=path("DATABASE_PATH", DATA_DIR / "chat.db"),
+            database_url=text("DATABASE_URL", "postgresql://streambot:streambot@localhost:5440/streambot") or "",
+            db_pool_max=number("DB_POOL_MAX", 10, integer=True, minimum=1),
             prices_path=path("PRICES_PATH", DATA_DIR / "prices.toml"),
             cors_origins=tuple(o.strip() for o in origins.split(",") if o.strip()) if origins else (),
             log_level=(text("LOG_LEVEL", "INFO") or "INFO").upper(),

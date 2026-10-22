@@ -1,7 +1,6 @@
 """HTTP-level tests through FastAPI's in-process TestClient (ScriptedLLM, no network)."""
 import pytest
 
-from app.db import Database
 from tests.helpers import ScriptedLLM, ok_script, parse_sse
 
 
@@ -36,10 +35,10 @@ def test_delete_conversation(make_client):
     assert client.delete(f"/conversations/{cid}").status_code == 404
 
 
-def test_cannot_delete_a_conversation_while_a_reply_is_streaming(make_client, settings):
+def test_cannot_delete_a_conversation_while_a_reply_is_streaming(make_client, settings, db):
     client = make_client()
     cid = new_conversation(client)
-    Database(settings.database_path).add_message(cid, "assistant", "", status="streaming")
+    db.add_message(cid, "assistant", "", status="streaming")
 
     assert client.delete(f"/conversations/{cid}").status_code == 409
     assert client.get(f"/conversations/{cid}").status_code == 200
@@ -166,10 +165,9 @@ def test_oversized_request_body_is_rejected_by_content_length(make_client):
                        headers={"content-type": "application/json"}).status_code == 413
 
 
-def test_second_message_while_a_reply_is_streaming_is_409(make_client, settings):
+def test_second_message_while_a_reply_is_streaming_is_409(make_client, settings, db):
     client = make_client()
     cid = new_conversation(client)
-    db = Database(settings.database_path)
     db.add_message(cid, "user", "q")
     db.add_message(cid, "assistant", status="streaming")  # a reply is in flight
     assert send(client, cid).status_code == 409
@@ -194,8 +192,7 @@ def test_streaming_response_headers_disable_buffering_and_caching(make_client):
 
 
 # ── crash recovery ───────────────────────────────────────────────────────
-def test_replies_orphaned_by_a_crash_become_errors_on_startup_with_text_kept(make_client, settings):
-    db = Database(settings.database_path)
+def test_replies_orphaned_by_a_crash_become_errors_on_startup_with_text_kept(make_client, settings, db):
     db.init_schema()
     cid = db.create_conversation()["id"]
     db.add_message(cid, "user", "q")
@@ -314,11 +311,10 @@ def wait_for(predicate, timeout=3.0):
     return False
 
 
-def test_a_long_chat_gets_summarized_and_the_next_turn_uses_the_summary(make_client, settings):
+def test_a_long_chat_gets_summarized_and_the_next_turn_uses_the_summary(make_client, settings, db):
     llm = ScriptedLLM(ok_script("a" * 100))
     client = make_client(llm, history_budget_tokens=200, max_message_chars=500)
     cid = new_conversation(client)
-    db = Database(settings.database_path)
 
     for i in range(6):
         send(client, cid, f"question {i} " + "q" * 80)
@@ -346,21 +342,21 @@ def test_short_chats_are_never_summarized(make_client, settings):
     assert llm.summary_requests == []
 
 
-def test_memory_can_be_switched_off(make_client, settings):
+def test_memory_can_be_switched_off(make_client, settings, db):
     llm = ScriptedLLM(ok_script("a" * 100))
     client = make_client(llm, history_budget_tokens=200, max_message_chars=500, memory_summary_enabled=False)
     cid = new_conversation(client)
     for i in range(6):
         send(client, cid, f"question {i} " + "q" * 80)
     time.sleep(0.2)
-    assert llm.summary_requests == [] and Database(settings.database_path).get_summary(cid) == (None, None)
+    assert llm.summary_requests == [] and db.get_summary(cid) == (None, None)
 
 
-def test_the_title_call_is_recorded_in_llm_calls(make_client, settings):
+def test_the_title_call_is_recorded_in_llm_calls(make_client, settings, db):
     client = make_client(ScriptedLLM(ok_script("ok"), title="A Title"))
     cid = new_conversation(client)
     send(client, cid, "hello")
-    (call,) = Database(settings.database_path).list_llm_calls(cid)
+    (call,) = db.list_llm_calls(cid)
     assert call["purpose"] == "title" and call["total_tokens"] == 36 and call["served_model"] == "title-snapshot"
 
 

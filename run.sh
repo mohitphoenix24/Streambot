@@ -40,6 +40,18 @@ if [[ ! -d "$ROOT/frontend/node_modules" ]]; then
   (cd "$ROOT/frontend" && npm install --no-audit --no-fund)
 fi
 
+# ── 1b. the database: PostgreSQL (with pgvector) in Docker ───────────────
+command -v docker >/dev/null || die "Docker is not installed. Streambot's database runs in a container (see docker-compose.yml)."
+(cd "$ROOT" && docker compose up -d postgres >/dev/null 2>&1) || die "Could not start PostgreSQL. Try: docker compose up -d postgres"
+echo "▶ Waiting for PostgreSQL..."
+status=none
+for _ in $(seq 1 60); do
+  status=$(docker inspect -f '{{.State.Health.Status}}' streambot-postgres 2>/dev/null || echo none)
+  [[ "$status" == "healthy" ]] && break
+  sleep 1
+done
+[[ "$status" == "healthy" ]] || die "PostgreSQL did not become healthy. Check: docker logs streambot-postgres"
+
 port_in_use "$BACKEND_PORT" && die "Port $BACKEND_PORT is already in use. Use --backend-port N."
 
 # ── 2. configuration check (fails early with an actionable message) ──────

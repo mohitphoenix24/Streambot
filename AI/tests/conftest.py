@@ -1,10 +1,15 @@
+import os
+import uuid
+
 import httpx
 import httpx2
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.config import Settings
+from app.db import Database
 from tests.helpers import ScriptedLLM, ok_script
 
 
@@ -25,12 +30,58 @@ def forbid_real_network(monkeypatch):
     monkeypatch.setattr(httpx.AsyncClient, "send", blocked)  # also the live FX lookup
 
 
+# ── PostgreSQL for tests ─────────────────────────────────────────────────
+# Every test gets its OWN throwaway database, cloned from a migrated template. Cloning is a
+# file copy inside Postgres (tens of milliseconds), so tests stay isolated without
+# re-running the migrations, and cannot interfere with each other or with your real data.
+# Start the server first:  docker compose up -d postgres
+ADMIN_URL = os.environ.get("TEST_DATABASE_URL", "postgresql://streambot:streambot@localhost:5440/postgres")
+TEMPLATE = "streambot_test_template"
+
+
+def _url_for(name: str) -> str:
+    base, _, _ = ADMIN_URL.rpartition("/")
+    return f"{base}/{name}"
+
+
+@pytest.fixture(scope="session")
+def template_database():
+    try:
+        admin = psycopg.connect(ADMIN_URL, autocommit=True, connect_timeout=5)
+    except psycopg.OperationalError as exc:  # pragma: no cover - environment problem, say what to do
+        pytest.exit(f"Cannot reach PostgreSQL for the tests ({exc}).\nStart it with: docker compose up -d postgres", returncode=2)
+    with admin:
+        admin.execute(f'DROP DATABASE IF EXISTS "{TEMPLATE}" WITH (FORCE)')
+        admin.execute(f'CREATE DATABASE "{TEMPLATE}"')
+        template = Database(_url_for(TEMPLATE))
+        template.init_schema()  # runs every migration once
+        template.close()  # a template must have no open connections
+        yield TEMPLATE
+        admin.execute(f'DROP DATABASE IF EXISTS "{TEMPLATE}" WITH (FORCE)')
+
+
 @pytest.fixture
-def settings(tmp_path):
+def database_url(template_database):
+    name = f"t_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(ADMIN_URL, autocommit=True) as admin:
+        admin.execute(f'CREATE DATABASE "{name}" TEMPLATE "{template_database}"')
+        yield _url_for(name)
+        admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+@pytest.fixture
+def db(database_url):
+    database = Database(database_url)
+    yield database
+    database.close()
+
+
+@pytest.fixture
+def settings(tmp_path, database_url):
     return Settings(
         openai_api_key="test-key",  # never used: tests inject a ScriptedLLM
         openai_model="test-model",
-        database_path=tmp_path / "chat.db",
+        database_url=database_url,
         prices_path=tmp_path / "prices.toml",  # absent -> no prices unless a test writes one
         rate_limit_per_minute=0,
         usd_to_inr=88.0,  # fixed: tests must not fetch a live exchange rate

@@ -7,7 +7,6 @@ import pytest
 from app.chat.history import approx_tokens, build_history
 from app.chat.memory import KEEP_RECENT, SUMMARIZE_ABOVE, MemoryManager, plan_summary
 from app.config import Settings
-from app.db import Database
 from app.llm.pricing import PriceTable
 from tests.helpers import ScriptedLLM, ok_script
 
@@ -113,10 +112,8 @@ def test_a_summary_pointing_at_an_unknown_message_is_ignored():
 
 # ── MemoryManager ────────────────────────────────────────────────────────
 @pytest.fixture
-def setup(tmp_path):
-    settings = Settings(openai_api_key="k", openai_model="m", database_path=tmp_path / "t.db", history_budget_tokens=1000)
-    db = Database(settings.database_path)
-    db.init_schema()
+def setup(db, database_url):
+    settings = Settings(openai_api_key="k", openai_model="m", database_url=database_url, history_budget_tokens=1000)
     llm = ScriptedLLM(ok_script("x"))
     manager = MemoryManager(db, llm, PriceTable(), settings)
     cid = db.create_conversation()["id"]
@@ -205,7 +202,7 @@ async def test_a_chat_deleted_mid_summary_is_handled(setup):
     assert len(db.list_llm_calls()) == 1  # the money was spent, so the call is still recorded
 
 
-async def test_disabled_memory_schedules_nothing(setup, tmp_path):
+async def test_disabled_memory_schedules_nothing(setup):
     db, llm, _, cid = setup
     off = MemoryManager(db, llm, PriceTable(), Settings(openai_api_key="k", openai_model="m", memory_summary_enabled=False))
     fill(db, cid, 20)

@@ -1,17 +1,8 @@
-"""Database tests. Real SQLite, real file (pytest's tmp_path) - no mocks needed,
-because SQLite is fast and deterministic."""
-import sqlite3
-
+"""Database tests: a REAL PostgreSQL database per test (see conftest.py), no mocks.
+The constraints, cascades and ordering rules are the database's job, so they are tested
+against the database itself."""
+import psycopg
 import pytest
-
-from app.db import Database
-
-
-@pytest.fixture
-def db(tmp_path):
-    database = Database(tmp_path / "test.db")
-    database.init_schema()
-    return database
 
 
 def test_conversation_creation(db):
@@ -69,7 +60,7 @@ def test_message_update(db):
 
 def test_messages_come_back_in_insertion_order(db):
     conv = db.create_conversation()
-    # Created in the same millisecond on purpose: rowid must break the tie.
+    # Created in the same millisecond on purpose: seq (insertion order) must break the tie.
     ids = [db.add_message(conv["id"], r, f"m{i}")["id"]
            for i, r in enumerate(["user", "assistant", "user", "assistant"])]
     assert [m["id"] for m in db.list_messages(conv["id"])] == ids
@@ -85,13 +76,13 @@ def test_update_rejects_unknown_column_and_bad_status(db):
 
 
 def test_foreign_key_is_enforced(db):
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
         db.add_message("no-such-conversation", "user", "orphan")
 
 
 def test_check_constraints_reject_bad_role(db):
     conv = db.create_conversation()
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(psycopg.errors.CheckViolation):
         db.add_message(conv["id"], "system", "nope")
 
 
@@ -142,25 +133,7 @@ def test_llm_calls_are_recorded_and_survive_deleting_the_conversation(db):
 
 
 def test_llm_calls_reject_unknown_purpose_and_columns(db):
-    import sqlite3
-
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(psycopg.errors.CheckViolation):
         db.add_llm_call(None, "gossip", "m")
     with pytest.raises(ValueError):
         db.add_llm_call(None, "title", "m", evil="1; DROP TABLE messages")
-
-
-def test_old_databases_gain_the_summary_columns(tmp_path):
-    import sqlite3
-
-    path = tmp_path / "old.db"
-    conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE conversations(id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
-    conn.execute("INSERT INTO conversations VALUES ('c', 't', 'x', 'x')")
-    conn.commit(); conn.close()
-
-    migrated = Database(path)
-    migrated.init_schema()
-    assert migrated.get_summary("c") == (None, None)
-    migrated.set_summary("c", "s", "m1")
-    assert migrated.get_summary("c") == ("s", "m1")

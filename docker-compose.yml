@@ -1,0 +1,29 @@
+# Streambot's database: PostgreSQL with the pgvector extension (vector search for attachments).
+#
+#   docker compose up -d postgres      # start it (./run.sh does this for you)
+#   docker compose down                # stop it (the data volume is kept)
+#   docker compose down -v             # stop it AND delete all data
+#
+# It listens on 127.0.0.1:5440 only (not on your network). The password below is for local
+# development; set POSTGRES_PASSWORD (and the matching DATABASE_URL) for anything shared.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: streambot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: streambot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-streambot}
+      POSTGRES_DB: streambot
+    ports:
+      - "127.0.0.1:5440:5432"
+    volumes:
+      - streambot_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streambot -d streambot"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  streambot_pgdata:

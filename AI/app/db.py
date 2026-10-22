@@ -1,6 +1,7 @@
-"""SQLite persistence: conversations and messages.
+"""PostgreSQL persistence: conversations and messages.
 
-Design notes (the "why" behind the schema):
+The schema lives in migrations/*.sql (see app/migrations.py); this module is every SQL
+statement the app runs. Design notes (the "why" behind the schema):
 
 * conversations and messages are SEPARATE tables. A conversation is one thing
   with a title; it owns MANY messages. Putting both in one table would repeat the
@@ -19,116 +20,41 @@ Design notes (the "why" behind the schema):
 * messages.status exists because a reply is a PROCESS, not an instant. While
   tokens stream in, the row is 'streaming'; it ends as 'complete', 'cancelled'
   (user pressed Stop) or 'error'. Without it you could not tell a finished
-  answer from one that died halfway. See the state diagram in README.md.
+  answer from one that died halfway.
 
 * NULL means "unknown", never 0. cost_usd NULL = "no price configured", which is
   honest; 0.0 would be a lie.
 
-Every method opens a short-lived connection. SQLite calls here are
-sub-millisecond single-row operations, so running them directly inside async
-code is fine for this project (the upgrade path is aiosqlite or a thread pool).
-WAL mode lets readers proceed while a writer is active.
+Connections come from a POOL (opening a Postgres connection costs milliseconds, so
+connections are reused). Every method borrows one, does one small thing, and returns it;
+the borrow commits on success and rolls back on any error. The calls are SYNCHRONOUS on
+purpose: they take well under a millisecond on a local database, and keeping them
+synchronous preserves a property the streaming code relies on, namely that the final
+`finally` block that saves a reply contains no `await`, so a cancelled task cannot be
+interrupted halfway through saving. (The cost is that a slow database stalls the event
+loop; the upgrade path is psycopg's async pool plus a shielded save.)
 """
 from __future__ import annotations
 
-import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Iterator
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 STATUSES = ("streaming", "complete", "cancelled", "error")
 ROLES = ("user", "assistant")
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS conversations (
-    id          TEXT PRIMARY KEY,
-    title       TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL,
-    -- Rolling memory: a summary of the oldest messages, and the id of the last message
-    -- it covers. Everything after that message is still sent verbatim.
-    summary             TEXT,
-    summary_through_id  TEXT
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id                TEXT PRIMARY KEY,
-    conversation_id   TEXT NOT NULL
-                      REFERENCES conversations(id) ON DELETE CASCADE,
-    role              TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
-    content           TEXT NOT NULL DEFAULT '',
-    status            TEXT NOT NULL
-                      CHECK (status IN ('streaming', 'complete', 'cancelled', 'error')),
-    -- Usage REPORTED by the provider (NULL = unavailable; never estimated):
-    input_tokens        INTEGER,   -- includes the cached part
-    cached_input_tokens INTEGER,   -- subset of input_tokens, billed at the cached rate
-    output_tokens       INTEGER,   -- includes reasoning tokens
-    reasoning_tokens    INTEGER,   -- subset of output_tokens (observability only)
-    total_tokens        INTEGER,
-    cost_usd            REAL,      -- from usage x prices.toml; NULL = unpriced/unknown
-    stop_reason       TEXT,
-    -- Beyond the required fields: measured facts about each reply.
-    model             TEXT,     -- REQUESTED model (what we asked for, from OPENAI_MODEL)
-    served_model      TEXT,     -- model id OpenAI reports it actually served (may be a snapshot)
-    ttft_ms           REAL,     -- time to first token (NULL if none arrived)
-    latency_ms        REAL,     -- total time until the reply finished
-    sources           TEXT,     -- JSON list of web sources cited by this reply (NULL = none)
-    web_searches      INTEGER,  -- how many web searches this reply ran
-    created_at        TEXT NOT NULL
-);
-
--- Model calls that are not a chat reply (titles, summaries), so their cost is not lost.
--- No foreign key on purpose: spend history must survive deleting the conversation.
-CREATE TABLE IF NOT EXISTS llm_calls (
-    id                  TEXT PRIMARY KEY,
-    conversation_id     TEXT,
-    purpose             TEXT NOT NULL CHECK (purpose IN ('title', 'summary')),
-    model               TEXT NOT NULL,
-    served_model        TEXT,
-    input_tokens        INTEGER,
-    cached_input_tokens INTEGER,
-    output_tokens       INTEGER,
-    reasoning_tokens    INTEGER,
-    total_tokens        INTEGER,
-    cost_usd            REAL,
-    created_at          TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_llm_calls_created ON llm_calls (created_at);
-
--- Usage of replies whose chat was deleted. Deleting a chat removes its CONTENT, but the
--- tokens were spent either way, so each reply's numbers (never its text) are kept here.
-CREATE TABLE IF NOT EXISTS archived_replies (
-    id                  TEXT PRIMARY KEY,   -- the original message id
-    conversation_id     TEXT,
-    model               TEXT,
-    served_model        TEXT,
-    input_tokens        INTEGER,
-    cached_input_tokens INTEGER,
-    output_tokens       INTEGER,
-    reasoning_tokens    INTEGER,
-    total_tokens        INTEGER,
-    cost_usd            REAL,
-    web_searches        INTEGER,
-    created_at          TEXT NOT NULL,      -- when the reply happened (keeps it on the right day)
-    archived_at         TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_archived_replies_created ON archived_replies (created_at);
-
--- Loading a conversation = "all messages for conversation X, oldest first".
-CREATE INDEX IF NOT EXISTS idx_messages_conversation
-    ON messages (conversation_id, created_at);
-
--- Sidebar = "conversations, most recently active first".
-CREATE INDEX IF NOT EXISTS idx_conversations_updated
-    ON conversations (updated_at DESC);
-
--- Tiny partial index: only 'streaming' rows are indexed, so crash recovery
--- ("which replies were in flight?") is instant however big the table gets.
-CREATE INDEX IF NOT EXISTS idx_messages_streaming
-    ON messages (status) WHERE status = 'streaming';
-"""
+# Everything a message row carries, in one place (so `seq`, the ordering column, never leaks out).
+_MESSAGE_COLUMNS = (
+    "id, conversation_id, role, content, status, input_tokens, cached_input_tokens, output_tokens, "
+    "reasoning_tokens, total_tokens, cost_usd, stop_reason, model, served_model, ttft_ms, latency_ms, "
+    "sources, web_searches, created_at"
+)
 
 # Columns update_message() is allowed to touch. Column names cannot be bound as
 # SQL parameters, so we whitelist them rather than interpolating caller input.
@@ -138,67 +64,61 @@ _UPDATABLE = {
     "served_model", "ttft_ms", "latency_ms", "sources", "web_searches",
 }
 
-# Columns added after the first release. CREATE TABLE IF NOT EXISTS does not alter
-# a table that already exists, so older database files get these via ALTER TABLE.
-_ADDED_COLUMNS = {
-    "messages": {
-        "cached_input_tokens": "INTEGER",
-        "reasoning_tokens": "INTEGER",
-        "served_model": "TEXT",
-        "sources": "TEXT",
-        "web_searches": "INTEGER",
-    },
-    "conversations": {
-        "summary": "TEXT",
-        "summary_through_id": "TEXT",
-    },
-}
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+def _iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def _new_id() -> str:
     return uuid.uuid4().hex
 
 
+def _clean(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A row as the rest of the app sees it: timestamps as ISO-8601 strings (the API's format)."""
+    if row is None:
+        return None
+    return {k: (_iso(v) if isinstance(v, datetime) else v) for k, v in row.items()}
+
+
 class Database:
-    def __init__(self, path: Path | str) -> None:
-        self.path = str(path)
-        Path(path).parent.mkdir(parents=True, exist_ok=True)  # e.g. a fresh clone has no data/ yet
+    def __init__(self, url: str, pool_max: int = 10) -> None:
+        self.url = url
+        self._pool = ConnectionPool(
+            url, min_size=1, max_size=pool_max, open=False, name="streambot",
+            kwargs={"row_factory": dict_row},
+        )
+        self._open_lock = threading.Lock()
+        self._opened = False
+
+    def _ensure_open(self) -> None:
+        if self._opened:
+            return
+        with self._open_lock:
+            if not self._opened:
+                self._pool.open(wait=True, timeout=15)  # fails with a clear error if Postgres is not reachable
+                self._opened = True
+
+    def close(self) -> None:
+        if self._opened:
+            self._pool.close()
+            self._opened = False
 
     @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path, timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        # Foreign-key enforcement is OFF by default in SQLite and is a
-        # per-connection setting, so it must be switched on every time.
-        conn.execute("PRAGMA foreign_keys = ON")
-        try:
+    def connect(self) -> Iterator[psycopg.Connection]:
+        """Borrow a pooled connection. Commits on success, rolls back on any error."""
+        self._ensure_open()
+        with self._pool.connection() as conn:
             yield conn
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def init_schema(self) -> None:
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as conn:
-            conn.execute("PRAGMA journal_mode = WAL")
-            conn.executescript(SCHEMA)
-            self._migrate(conn)
+        """Bring the database up to the latest schema (applies pending migrations)."""
+        from app.migrations import migrate
 
-    @staticmethod
-    def _migrate(conn: sqlite3.Connection) -> None:
-        """Add columns introduced after a database file was first created."""
-        for table, columns in _ADDED_COLUMNS.items():
-            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-            for name, sql_type in columns.items():
-                if name not in existing:
-                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+        migrate(self)
 
     # ── conversations ────────────────────────────────────────────────────
     def create_conversation(self, title: str = "New chat") -> dict[str, Any]:
@@ -207,26 +127,26 @@ class Database:
         with self.connect() as conn:
             conn.execute(
                 "INSERT INTO conversations (id, title, created_at, updated_at) "
-                "VALUES (:id, :title, :created_at, :updated_at)",
+                "VALUES (%(id)s, %(title)s, %(created_at)s, %(updated_at)s)",
                 conv,
             )
-        return conv
+        return _clean(conv)  # type: ignore[return-value]
 
     def list_conversations(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
                 "SELECT id, title, created_at, updated_at FROM conversations "
-                "ORDER BY updated_at DESC, rowid DESC"
+                "ORDER BY updated_at DESC, seq DESC"
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [_clean(r) for r in rows]  # type: ignore[misc]
 
     def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT id, title, created_at, updated_at FROM conversations WHERE id = ?",
+                "SELECT id, title, created_at, updated_at FROM conversations WHERE id = %s",
                 (conversation_id,),
             ).fetchone()
-        return dict(row) if row else None
+        return _clean(row)
 
     def delete_conversation(self, conversation_id: str) -> bool:
         """Delete a conversation; its messages go with it (ON DELETE CASCADE).
@@ -237,30 +157,31 @@ class Database:
         """
         with self.connect() as conn:
             conn.execute(
-                "INSERT OR IGNORE INTO archived_replies "
+                "INSERT INTO archived_replies "
                 "(id, conversation_id, model, served_model, input_tokens, cached_input_tokens, output_tokens, "
                 " reasoning_tokens, total_tokens, cost_usd, web_searches, created_at, archived_at) "
                 "SELECT id, conversation_id, model, served_model, input_tokens, cached_input_tokens, output_tokens, "
-                "       reasoning_tokens, total_tokens, cost_usd, web_searches, created_at, ? "
-                "FROM messages WHERE conversation_id = ? AND role = 'assistant' "
-                "  AND (total_tokens IS NOT NULL OR cost_usd IS NOT NULL)",
+                "       reasoning_tokens, total_tokens, cost_usd, web_searches, created_at, %s "
+                "FROM messages WHERE conversation_id = %s AND role = 'assistant' "
+                "  AND (total_tokens IS NOT NULL OR cost_usd IS NOT NULL) "
+                "ON CONFLICT (id) DO NOTHING",
                 (_now(), conversation_id),
             )
-            cur = conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+            cur = conn.execute("DELETE FROM conversations WHERE id = %s", (conversation_id,))
         return cur.rowcount > 0
 
     def get_summary(self, conversation_id: str) -> tuple[str | None, str | None]:
         """(summary text, id of the last message it covers); (None, None) if there is none."""
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT summary, summary_through_id FROM conversations WHERE id = ?", (conversation_id,)
+                "SELECT summary, summary_through_id FROM conversations WHERE id = %s", (conversation_id,)
             ).fetchone()
         return (row["summary"], row["summary_through_id"]) if row and row["summary"] else (None, None)
 
     def set_summary(self, conversation_id: str, summary: str, through_message_id: str) -> None:
         with self.connect() as conn:
             conn.execute(
-                "UPDATE conversations SET summary = ?, summary_through_id = ? WHERE id = ?",
+                "UPDATE conversations SET summary = %s, summary_through_id = %s WHERE id = %s",
                 (summary, through_message_id, conversation_id),
             )
 
@@ -276,7 +197,7 @@ class Database:
                    "model": model, "created_at": _now(), **fields}
         with self.connect() as conn:
             conn.execute(
-                f"INSERT INTO llm_calls ({', '.join(columns)}) VALUES ({', '.join(':' + c for c in columns)})",
+                f"INSERT INTO llm_calls ({', '.join(columns)}) VALUES ({', '.join('%(' + c + ')s' for c in columns)})",
                 columns,  # column names come from the whitelist above, values are bound
             )
         return call_id
@@ -284,17 +205,17 @@ class Database:
     def list_llm_calls(self, conversation_id: str | None = None) -> list[dict[str, Any]]:
         with self.connect() as conn:
             if conversation_id is None:
-                rows = conn.execute("SELECT * FROM llm_calls ORDER BY created_at, rowid").fetchall()
+                rows = conn.execute("SELECT * FROM llm_calls ORDER BY created_at, id").fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM llm_calls WHERE conversation_id = ? ORDER BY created_at, rowid",
+                    "SELECT * FROM llm_calls WHERE conversation_id = %s ORDER BY created_at, id",
                     (conversation_id,),
                 ).fetchall()
-        return [dict(r) for r in rows]
+        return [_clean(r) for r in rows]  # type: ignore[misc]
 
-    def usage_rows(self, since_iso: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Everything that cost (or may have cost) money since `since_iso` (UTC, same ISO
-        format we store): assistant replies that reported usage, and title/summary calls.
+    def usage_rows(self, since: datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Everything that cost (or may have cost) money since `since` (an aware datetime):
+        assistant replies that reported usage, and title/summary calls.
         Replies carry the conversation title (None if the chat was deleted since)."""
         with self.connect() as conn:
             replies = conn.execute(
@@ -302,39 +223,34 @@ class Database:
                 "       m.input_tokens, m.cached_input_tokens, m.output_tokens, m.reasoning_tokens, "
                 "       m.total_tokens, m.cost_usd, m.web_searches, m.created_at "
                 "FROM messages m LEFT JOIN conversations c ON c.id = m.conversation_id "
-                "WHERE m.role = 'assistant' AND m.created_at >= ? "
+                "WHERE m.role = 'assistant' AND m.created_at >= %s "
                 "  AND (m.total_tokens IS NOT NULL OR m.cost_usd IS NOT NULL) "
                 "ORDER BY m.created_at",
-                (since_iso,),
+                (since,),
             ).fetchall()
             calls = conn.execute(
                 "SELECT id, conversation_id, purpose, model, served_model, input_tokens, cached_input_tokens, "
                 "       output_tokens, reasoning_tokens, total_tokens, cost_usd, created_at "
-                "FROM llm_calls WHERE created_at >= ? ORDER BY created_at",
-                (since_iso,),
+                "FROM llm_calls WHERE created_at >= %s ORDER BY created_at",
+                (since,),
             ).fetchall()
             archived = conn.execute(
                 "SELECT id, conversation_id, NULL AS conversation_title, model, served_model, input_tokens, "
                 "       cached_input_tokens, output_tokens, reasoning_tokens, total_tokens, cost_usd, "
                 "       web_searches, created_at "
-                "FROM archived_replies WHERE created_at >= ? ORDER BY created_at",
-                (since_iso,),
+                "FROM archived_replies WHERE created_at >= %s ORDER BY created_at",
+                (since,),
             ).fetchall()
         # Replies of deleted chats count like any other reply; they just have no chat to link to.
-        return [dict(r) for r in replies] + [dict(r) for r in archived], [dict(r) for r in calls]
+        return [_clean(r) for r in replies] + [_clean(r) for r in archived], [_clean(r) for r in calls]  # type: ignore[misc]
 
     def set_title(self, conversation_id: str, title: str) -> None:
         with self.connect() as conn:
-            conn.execute(
-                "UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id)
-            )
+            conn.execute("UPDATE conversations SET title = %s WHERE id = %s", (title, conversation_id))
 
     def touch_conversation(self, conversation_id: str) -> None:
         with self.connect() as conn:
-            conn.execute(
-                "UPDATE conversations SET updated_at = ? WHERE id = ?",
-                (_now(), conversation_id),
-            )
+            conn.execute("UPDATE conversations SET updated_at = %s WHERE id = %s", (_now(), conversation_id))
 
     # ── messages ─────────────────────────────────────────────────────────
     def add_message(
@@ -345,31 +261,32 @@ class Database:
         status: str = "complete",
         model: str | None = None,
     ) -> dict[str, Any]:
-        """Insert a message. Raises sqlite3.IntegrityError for a bad conversation_id,
+        """Insert a message. Raises psycopg.errors.IntegrityError for a bad conversation_id,
         role or status (foreign key / CHECK constraints)."""
-        msg_id = _new_id()
         with self.connect() as conn:
-            conn.execute(
-                "INSERT INTO messages (id, conversation_id, role, content, status, model, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (msg_id, conversation_id, role, content, status, model, _now()),
-            )
-        return self.get_message(msg_id)  # type: ignore[return-value]
+            row = conn.execute(
+                f"INSERT INTO messages (id, conversation_id, role, content, status, model, created_at) "
+                f"VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING {_MESSAGE_COLUMNS}",
+                (_new_id(), conversation_id, role, content, status, model, _now()),
+            ).fetchone()
+        return _clean(row)  # type: ignore[return-value]
 
     def get_message(self, message_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
-        return dict(row) if row else None
+            row = conn.execute(
+                f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE id = %s", (message_id,)
+            ).fetchone()
+        return _clean(row)
 
     def list_messages(self, conversation_id: str) -> list[dict[str, Any]]:
-        # rowid breaks ties: a user message and its assistant placeholder are
-        # created in the same millisecond, and insertion order must win.
+        # seq is insertion order: a user message and its assistant placeholder are created in
+        # the same millisecond, so the timestamp alone cannot order them.
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at, rowid",
+                f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE conversation_id = %s ORDER BY seq",
                 (conversation_id,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [_clean(r) for r in rows]  # type: ignore[misc]
 
     def update_message(self, message_id: str, **fields: Any) -> None:
         unknown = set(fields) - _UPDATABLE
@@ -379,17 +296,17 @@ class Database:
             return
         if "status" in fields and fields["status"] not in STATUSES:
             raise ValueError(f"invalid status: {fields['status']!r}")
-        assignments = ", ".join(f"{col} = :{col}" for col in fields)  # whitelisted names only
+        assignments = ", ".join(f"{col} = %({col})s" for col in fields)  # whitelisted names only
         with self.connect() as conn:
             conn.execute(
-                f"UPDATE messages SET {assignments} WHERE id = :_id",
+                f"UPDATE messages SET {assignments} WHERE id = %(_id)s",
                 {**fields, "_id": message_id},
             )
 
     def has_streaming_message(self, conversation_id: str) -> bool:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT 1 FROM messages WHERE conversation_id = ? AND status = 'streaming' LIMIT 1",
+                "SELECT 1 AS found FROM messages WHERE conversation_id = %s AND status = 'streaming' LIMIT 1",
                 (conversation_id,),
             ).fetchone()
         return row is not None
@@ -426,7 +343,7 @@ class Database:
                 # assistant replies that finished with usage but have no price
                 "       COALESCE(SUM(CASE WHEN role = 'assistant' AND total_tokens IS NOT NULL "
                 "                         AND cost_usd IS NULL THEN 1 ELSE 0 END), 0) AS unpriced_messages "
-                "FROM messages WHERE conversation_id = ?",
+                "FROM messages WHERE conversation_id = %s",
                 (conversation_id,),
             ).fetchone()
-        return dict(row)
+        return {k: (int(v) if k != "total_cost_usd" else float(v)) for k, v in row.items()}  # type: ignore[union-attr]

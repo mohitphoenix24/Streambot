@@ -12,19 +12,12 @@ PRICES = PriceTable({"m": ModelPrice(1.0, 4.0, 0.1)})  # $/1M: input 1.0, cached
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
 
 
-@pytest.fixture
-def db(tmp_path):
-    d = Database(tmp_path / "t.db")
-    d.init_schema()
-    return d
-
-
 def reply(db, cid, when, *, inp=1000, cached=0, out=100, cost=0.002, searches=None, model="m", status="complete"):
     msg = db.add_message(cid, "assistant", "x", status=status, model=model)
     db.update_message(msg["id"], status=status, input_tokens=inp, cached_input_tokens=cached, output_tokens=out,
                       total_tokens=inp + out, cost_usd=cost, web_searches=searches)
     with db.connect() as conn:
-        conn.execute("UPDATE messages SET created_at = ? WHERE id = ?", (when, msg["id"]))
+        conn.execute("UPDATE messages SET created_at = %s WHERE id = %s", (datetime.fromisoformat(when), msg["id"]))
     return msg["id"]
 
 
@@ -32,7 +25,7 @@ def side_call(db, cid, purpose, when, *, inp=200, cached=0, out=20, cost=0.0003,
     call_id = db.add_llm_call(cid, purpose, model, input_tokens=inp, cached_input_tokens=cached,
                               output_tokens=out, total_tokens=inp + out, cost_usd=cost)
     with db.connect() as conn:
-        conn.execute("UPDATE llm_calls SET created_at = ? WHERE id = ?", (when, call_id))
+        conn.execute("UPDATE llm_calls SET created_at = %s WHERE id = %s", (datetime.fromisoformat(when), call_id))
 
 
 def report(db, **kw):
@@ -168,8 +161,9 @@ def test_the_archive_keeps_numbers_never_content(db):
     db.delete_conversation(cid)
 
     with db.connect() as conn:
-        columns = [r["name"] for r in conn.execute("PRAGMA table_info(archived_replies)")]
-        dump = " ".join(str(v) for row in conn.execute("SELECT * FROM archived_replies") for v in tuple(row))
+        columns = [r["column_name"] for r in conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'archived_replies'")]
+        dump = " ".join(str(v) for row in conn.execute("SELECT * FROM archived_replies") for v in row.values())
     assert "content" not in columns and "private" not in dump
     assert db.get_message(msg_id) is None  # and the message itself really is gone
 
@@ -180,7 +174,7 @@ def test_replies_without_usage_are_not_archived(db):
     db.add_message(cid, "assistant", "no usage was ever reported", status="error")
     db.delete_conversation(cid)
     with db.connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM archived_replies").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) AS n FROM archived_replies").fetchone()["n"] == 0
 
 
 def test_deleting_the_same_chat_twice_never_double_counts(db):
@@ -202,23 +196,3 @@ def test_live_and_deleted_chats_add_up_without_overlap(db):
     r = report(db)
     assert r["totals"]["cost_usd"] == pytest.approx(0.0073) and r["totals"]["replies"] == 3 and r["totals"]["calls"] == 4
     assert [c["title"] for c in r["top_conversations"]] == ["Keep"]
-
-
-def test_old_databases_get_the_archive_table_on_startup(tmp_path):
-    import sqlite3
-
-    path = tmp_path / "old.db"
-    conn = sqlite3.connect(path)
-    conn.executescript(
-        "CREATE TABLE conversations(id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);"
-        "CREATE TABLE messages(id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,"
-        " role TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER,"
-        " total_tokens INTEGER, cost_usd REAL, stop_reason TEXT, model TEXT, ttft_ms REAL, latency_ms REAL, created_at TEXT NOT NULL);"
-    )
-    conn.commit(); conn.close()
-    migrated = Database(path)
-    migrated.init_schema()
-    cid = migrated.create_conversation()["id"]
-    reply(migrated, cid, "2026-10-22T09:00:00.000+00:00", cost=0.002)
-    migrated.delete_conversation(cid)
-    assert build_usage_report(migrated, PRICES, now=NOW, days=7)["totals"]["cost_usd"] == pytest.approx(0.002)

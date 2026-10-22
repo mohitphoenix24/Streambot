@@ -37,11 +37,11 @@ class EndlessLLM(ScriptedLLM):
 
 
 @pytest.fixture
-def live_server(tmp_path):
+def live_server(database_url):
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    settings = Settings(openai_api_key="test-key", openai_model="test-model", database_path=tmp_path / "live.db", rate_limit_per_minute=0,
+    settings = Settings(openai_api_key="test-key", openai_model="test-model", database_url=database_url, rate_limit_per_minute=0,
                         partial_flush_interval_s=0.1)
     llm = EndlessLLM([])
     server = uvicorn.Server(uvicorn.Config(create_app(settings, llm), host="127.0.0.1", port=port, log_level="warning"))
@@ -51,9 +51,11 @@ def live_server(tmp_path):
     while not server.started and time.time() < deadline:
         time.sleep(0.02)
     assert server.started, "server did not start"
-    yield f"http://127.0.0.1:{port}", Database(settings.database_path), llm
+    database = Database(database_url)
+    yield f"http://127.0.0.1:{port}", database, llm
     server.should_exit = True
     thread.join(timeout=5)
+    database.close()
 
 
 def wait_for(predicate, timeout=5.0):

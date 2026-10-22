@@ -7,7 +7,6 @@ import asyncio
 
 import pytest
 
-from app.db import Database
 from app.llm.client import Completed, LLMError, TextDelta, Usage
 from app.llm.pricing import PriceTable
 from app.chat.streaming import begin_turn, stream_reply
@@ -148,13 +147,6 @@ class FakeRequest:
     async def is_disconnected(self) -> bool:
         self.polls += 1
         return self.disconnect_on_poll is not None and self.polls >= self.disconnect_on_poll
-
-
-@pytest.fixture
-def db(settings):
-    database = Database(settings.database_path)
-    database.init_schema()
-    return database
 
 
 def start_turn(db, settings, llm):

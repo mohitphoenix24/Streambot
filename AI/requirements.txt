@@ -7,6 +7,18 @@ tomli>=2.0; python_version < "3.11"   # tomllib is stdlib from 3.11
 
 httpx>=0.27          # live USD->INR rate lookup (and FastAPI's TestClient)
 
+# database: PostgreSQL (+ pgvector for attachments)
+psycopg[binary,pool]>=3.2
+
+# authentication
+argon2-cffi>=23.1    # password hashing
+PyJWT>=2.8           # signed tokens
+
+# attachments
+python-multipart>=0.0.9   # multipart/form-data uploads
+pypdf>=4.2                # PDF text extraction
+python-docx>=1.1          # Word (.docx) text extraction
+
 # tests
 pytest>=8.0
 pytest-asyncio>=0.23

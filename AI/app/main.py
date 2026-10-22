@@ -51,7 +51,7 @@ def create_app(
     an app with a temp database and a scripted LLM without touching the environment.
     """
     settings = settings or Settings.from_env()
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, pool_max=settings.db_pool_max)
     prices = PriceTable.load(settings.prices_path)
     limiter = SlidingWindowLimiter(settings.rate_limit_per_minute)
     fx = fx or UsdInrProvider(settings.usd_to_inr, settings.usd_to_inr_fallback)
@@ -74,6 +74,7 @@ def create_app(
         if orphaned:
             log.warning("recovered_interrupted_messages count=%d", orphaned)
         yield
+        db.close()  # return the pooled connections when the server stops
 
     app = FastAPI(title="Streaming Chat", lifespan=lifespan)
     app.state.settings = settings

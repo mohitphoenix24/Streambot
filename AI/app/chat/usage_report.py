@@ -39,7 +39,7 @@ def build_usage_report(
     # The UTC instant at which `first_day` began on the user's clock.
     since = datetime.combine(first_day, time.min, tzinfo=timezone.utc) - offset
 
-    reply_rows, call_rows = db.usage_rows(since.isoformat(timespec="milliseconds"))
+    reply_rows, call_rows = db.usage_rows(since)
     calls: list[dict[str, Any]] = []
     for r in reply_rows:
         calls.append({**r, "purpose": "reply"})
