@@ -6,13 +6,24 @@ response shape (visible at /docs).
 """
 from __future__ import annotations
 
-from pydantic import BaseModel
+import json
+
+from pydantic import BaseModel, field_validator
 
 
 class SendMessageIn(BaseModel):
     # Length is enforced in the route, using the configurable MAX_MESSAGE_CHARS,
     # so the limit can change via env var without editing this class.
     text: str
+    # Let the model use the web search tool for this message (needs TAVILY_API_KEY).
+    web_search: bool = True
+
+
+class SourceOut(BaseModel):
+    n: int  # the [n] the reply uses to cite it
+    title: str
+    url: str
+    snippet: str = ""
 
 
 class MessageOut(BaseModel):
@@ -32,7 +43,17 @@ class MessageOut(BaseModel):
     served_model: str | None = None  # model OpenAI reports it served
     ttft_ms: float | None = None
     latency_ms: float | None = None
+    sources: list[SourceOut] = []
+    web_searches: int | None = None
     created_at: str
+
+    @field_validator("sources", mode="before")
+    @classmethod
+    def _decode_sources(cls, value):
+        # Stored as a JSON string in SQLite; NULL means none.
+        if value is None or value == "":
+            return []
+        return json.loads(value) if isinstance(value, str) else value
 
 
 class ConversationOut(BaseModel):

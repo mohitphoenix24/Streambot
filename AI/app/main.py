@@ -32,13 +32,16 @@ from app.core.limits import BodySizeLimitMiddleware, SlidingWindowLimiter
 from app.llm.client import LLM, LLMError, build_llm
 from app.llm.pricing import PriceTable
 from app.schemas import ConversationDetail, ConversationOut, MessageOut, SendMessageIn
+from app.tools.registry import ToolRunner
+from app.tools.web_search import TavilySearch
 from app.chat.streaming import begin_turn, finalize_complete, stream_reply
 
 log = logging.getLogger("chat.app")
 
 
 def create_app(
-    settings: Settings | None = None, llm: LLM | None = None, fx: UsdInrProvider | None = None
+    settings: Settings | None = None, llm: LLM | None = None, fx: UsdInrProvider | None = None,
+    search: TavilySearch | None = None,
 ) -> FastAPI:
     """App factory.
 
@@ -50,6 +53,8 @@ def create_app(
     prices = PriceTable.load(settings.prices_path)
     limiter = SlidingWindowLimiter(settings.rate_limit_per_minute)
     fx = fx or UsdInrProvider(settings.usd_to_inr, settings.usd_to_inr_fallback)
+    if search is None and settings.tavily_api_key:
+        search = TavilySearch(settings.tavily_api_key, settings.web_search_max_results)
     logging.basicConfig(
         level=settings.log_level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -180,10 +185,12 @@ def create_app(
         started_at = time.perf_counter()  # t0 for time-to-first-token
         text = prepare_send(request, conversation_id, body)
         turn = begin_turn(db, llm, settings, conversation_id, text)
+        # A fresh runner per reply: it owns the [1], [2], ... citation numbering.
+        tools = ToolRunner(search) if (search is not None and body.web_search) else None
         return StreamingResponse(
             stream_reply(
                 request=request, db=db, llm=llm, settings=settings, prices=prices,
-                turn=turn, started_at=started_at,
+                turn=turn, started_at=started_at, tools=tools,
             ),
             media_type="text/event-stream",
             headers={
@@ -232,7 +239,7 @@ def create_app(
         return db.get_message(assistant_id)
 
     @app.get("/info")
-    async def info(request: Request) -> dict[str, str | float | None]:
+    async def info(request: Request) -> dict[str, str | float | bool | None]:
         """Which model this server uses plus the display exchange rate. No secrets."""
         rate = await fx.get()
         return {
@@ -240,6 +247,7 @@ def create_app(
             "usd_to_inr": rate.rate,  # INR per 1 USD, or None (hidden)
             "usd_to_inr_source": rate.source,  # live | fallback | fixed | off
             "usd_to_inr_as_of": rate.as_of,
+            "web_search_available": search is not None,
         }
 
     return app

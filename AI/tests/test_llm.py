@@ -248,3 +248,168 @@ async def test_title_uses_the_title_model_when_configured(llm_factory):
 ])
 def test_clean_title(raw, expected):
     assert clean_title(raw) == expected
+
+
+# ── agent loop: model -> tool -> model ───────────────────────────────────
+from app.llm.client import ToolCallFinished, ToolCallStarted  # noqa: E402
+
+
+class FakeTools:
+    """Stands in for app.tools.ToolRunner: records calls, returns a canned outcome."""
+
+    definitions = [{"type": "function", "name": "web_search"}]
+    instructions = "USE TOOLS WISELY"
+
+    def __init__(self, error=None):
+        self.calls, self.error = [], error
+
+    async def run(self, name, arguments):
+        self.calls.append((name, arguments))
+        sources = () if self.error else ({"n": 1, "title": "T", "url": "https://e.com", "snippet": "s"},)
+        return NS(query="q", model_text="[1] T", sources=sources, error=self.error)
+
+
+def fn_call(call_id="call_1", args='{"query": "python release"}'):
+    return NS(type="function_call", call_id=call_id, name="web_search", arguments=args)
+
+
+def round_end(*output, usage=(10, 5, 15), status="completed", reason=None, kind="response.completed"):
+    u = NS(input_tokens=usage[0], output_tokens=usage[1], total_tokens=usage[2]) if usage else None
+    details = NS(reason=reason) if reason else None
+    return NS(type=kind, response=NS(status=status, incomplete_details=details, usage=u, model="m", output=list(output)))
+
+
+async def collect_with_tools(llm, tools):
+    events, error = [], None
+    try:
+        async for e in llm.stream([{"role": "user", "content": "hi"}], tools):
+            events.append(e)
+    except LLMError as exc:
+        error = exc
+    return events, error
+
+
+async def test_tool_call_runs_the_tool_and_continues_with_its_output(llm_factory):
+    reasoning = NS(type="reasoning", id="rs_1", encrypted_content="enc")
+    client = client_with(
+        StubStream([round_end(reasoning, fn_call())]),
+        StubStream([delta("Answer [1]"), round_end(usage=(20, 8, 28))]),
+    )
+    tools = FakeTools()
+    events, error = await collect_with_tools(llm_factory(client), tools)
+
+    assert error is None
+    assert [type(e) for e in events] == [ToolCallStarted, ToolCallFinished, TextDelta, Completed]
+    assert events[0] == ToolCallStarted("call_1", "web_search", "python release")
+    assert events[1].sources[0]["url"] == "https://e.com" and events[1].error is None
+    assert tools.calls == [("web_search", '{"query": "python release"}')]
+
+    first, second = client.responses.calls
+    assert first["tools"] == tools.definitions and first["include"] == ["reasoning.encrypted_content"]
+    assert first["instructions"] == "BE NICE\n\nUSE TOOLS WISELY"  # guidance only when tools are on
+    assert "tool_choice" not in first
+    # round 2 carries: the question, the model's reasoning + call, and the tool output
+    assert second["input"][0] == {"role": "user", "content": "hi"}
+    assert {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc"} in second["input"]
+    assert second["input"][-1] == {"type": "function_call_output", "call_id": "call_1", "output": "[1] T"}
+
+
+async def test_usage_is_summed_over_all_rounds(llm_factory):
+    client = client_with(
+        StubStream([round_end(fn_call(), usage=(10, 5, 15))]),
+        StubStream([delta("x"), round_end(usage=(20, 8, 28))]),
+    )
+    events, _ = await collect_with_tools(llm_factory(client), FakeTools())
+    done = events[-1]
+    assert (done.usage.input_tokens, done.usage.output_tokens, done.usage.total_tokens) == (30, 13, 43)
+
+
+async def test_usage_is_unknown_if_any_round_reported_none(llm_factory):
+    client = client_with(
+        StubStream([round_end(fn_call(), usage=None)]),
+        StubStream([delta("x"), round_end(usage=(20, 8, 28))]),
+    )
+    events, _ = await collect_with_tools(llm_factory(client), FakeTools())
+    assert events[-1].usage is None  # a partial sum would under-report cost
+
+
+async def test_round_cap_forces_an_answer(llm_factory):
+    # cap = 1 search: the 2nd request must forbid further tool calls
+    client = client_with(
+        StubStream([round_end(fn_call())]),
+        StubStream([delta("final"), round_end()]),
+    )
+    events, _ = await collect_with_tools(llm_factory(client, agent_max_searches=1), FakeTools())
+    first, second = client.responses.calls
+    assert "tool_choice" not in first and second["tool_choice"] == "none"
+    assert second["tools"] == FakeTools.definitions  # same tool list keeps the prompt prefix identical
+    assert isinstance(events[-1], Completed)
+
+
+async def test_even_if_the_model_calls_a_tool_at_the_cap_it_is_not_run(llm_factory):
+    client = client_with(
+        StubStream([round_end(fn_call())]),
+        StubStream([round_end(fn_call("call_2"))]),  # disobeys tool_choice=none
+    )
+    tools = FakeTools()
+    events, _ = await collect_with_tools(llm_factory(client, agent_max_searches=1), tools)
+    assert len(tools.calls) == 1 and isinstance(events[-1], Completed)
+
+
+async def test_a_retried_round_never_repeats_the_search(llm_factory):
+    client = client_with(
+        StubStream([round_end(fn_call())]),
+        openai.APIConnectionError(request=REQ),  # round 2, attempt 1: fails before any token
+        StubStream([delta("ok"), round_end()]),  # round 2, attempt 2
+    )
+    tools = FakeTools()
+    events, error = await collect_with_tools(llm_factory(client), tools)
+    assert error is None and len(tools.calls) == 1  # the tool ran once, not once per attempt
+    assert len(client.responses.calls) == 3
+    assert any(e == TextDelta("ok") for e in events)
+
+
+async def test_tool_errors_are_passed_to_the_model_not_raised(llm_factory):
+    client = client_with(
+        StubStream([round_end(fn_call())]),
+        StubStream([delta("sorry"), round_end()]),
+    )
+    events, error = await collect_with_tools(llm_factory(client), FakeTools(error="Web search is unavailable right now."))
+    assert error is None
+    assert events[1] == ToolCallFinished("call_1", "web_search", (), "Web search is unavailable right now.")
+
+
+async def test_a_truncated_round_does_not_run_tools(llm_factory):
+    client = client_with(StubStream([round_end(fn_call(), status="incomplete", reason="max_output_tokens", kind="response.incomplete")]))
+    tools = FakeTools()
+    events, _ = await collect_with_tools(llm_factory(client), tools)
+    assert tools.calls == [] and events[-1].stop_reason == "max_output_tokens"
+
+
+async def test_without_tools_the_request_is_exactly_as_before(llm_factory):
+    client = client_with(StubStream([delta("hi"), completed()]))
+    await collect(llm_factory(client))
+    (call,) = client.responses.calls
+    assert "tools" not in call and "include" not in call and "tool_choice" not in call
+    assert call["instructions"] == "BE NICE"
+
+
+async def test_default_cap_is_ten_searches_per_reply():
+    assert Settings().agent_max_searches == 10
+
+
+async def test_parallel_calls_beyond_the_cap_are_answered_but_not_run(llm_factory):
+    client = client_with(
+        StubStream([round_end(fn_call("c1"), fn_call("c2"), fn_call("c3"))]),
+        StubStream([delta("done"), round_end()]),
+    )
+    tools = FakeTools()
+    events, error = await collect_with_tools(llm_factory(client, agent_max_searches=2), tools)
+
+    assert error is None and len(tools.calls) == 2  # only 2 of the 3 searches ran
+    second = client.responses.calls[1]
+    outputs = [i for i in second["input"] if i.get("type") == "function_call_output"]
+    assert [o["call_id"] for o in outputs] == ["c1", "c2", "c3"]  # the API requires an output for every call
+    assert "limit" in outputs[2]["output"]
+    assert second["tool_choice"] == "none"  # cap reached -> must answer
+    assert sum(isinstance(e, ToolCallStarted) for e in events) == 2

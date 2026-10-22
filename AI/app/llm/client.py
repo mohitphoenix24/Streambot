@@ -4,7 +4,7 @@ Everything above this file (history, database, SSE, routes) speaks our own tiny
 vocabulary:
 
     history message : {"role": "user" | "assistant", "content": "..."}
-    events          : TextDelta(text), Completed(stop_reason, usage)
+    events          : TextDelta(text), ToolCallStarted/Finished, Completed(stop_reason, usage)
     failures        : LLMError(public_message, retryable)
 
 Everything below it is the OpenAI SDK. Keeping that wall means:
@@ -20,6 +20,7 @@ import logging
 import random
 from contextlib import aclosing
 from dataclasses import dataclass
+import json
 from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
 
 import anyio
@@ -66,7 +67,45 @@ class Completed:
     served_model: str | None = None  # provider-reported; see Completion.served_model
 
 
-LLMEvent = TextDelta | Completed
+@dataclass(frozen=True)
+class ToolCallStarted:
+    """The model asked for a tool and we are running it now."""
+
+    call_id: str
+    name: str
+    query: str | None  # the search text, shown to the user as "Searching the web for ..."
+
+
+@dataclass(frozen=True)
+class ToolCallFinished:
+    call_id: str
+    name: str
+    sources: tuple[dict[str, Any], ...]  # JSON-ready {n, title, url, snippet}
+    error: str | None = None  # safe message; None = the tool worked
+
+
+@dataclass(frozen=True)
+class _RoundEnd:
+    """Internal: how ONE model round ended. Never leaves this module."""
+
+    stop_reason: str
+    usage: Usage | None
+    served_model: str | None
+    output_items: list[dict[str, Any]]  # to feed back as input if tools were called
+    calls: list[dict[str, str]]  # {call_id, name, arguments}
+
+
+LLMEvent = TextDelta | ToolCallStarted | ToolCallFinished | Completed
+
+
+class ToolExecutor(Protocol):
+    """What the agent loop needs from a set of tools (implemented in app.tools)."""
+
+    definitions: list[dict[str, Any]]
+    instructions: str
+
+    async def run(self, name: str, arguments: str) -> Any:  # -> object with .model_text/.sources/.error/.query
+        ...
 
 
 class LLMError(Exception):
@@ -101,7 +140,7 @@ class LLM(Protocol):
 
     async def complete(self, history: list[HistoryMessage]) -> Completion: ...
 
-    def stream(self, history: list[HistoryMessage]) -> AsyncIterator[LLMEvent]: ...
+    def stream(self, history: list[HistoryMessage], tools: ToolExecutor | None = None) -> AsyncIterator[LLMEvent]: ...
 
     async def generate_title(self, first_user_text: str) -> str | None: ...
 
@@ -257,6 +296,7 @@ class OpenAILLM:
         self._max_output_tokens = settings.max_output_tokens
         self._max_attempts = settings.llm_max_attempts
         self._retry_base_delay = settings.retry_base_delay_s
+        self._max_searches = settings.agent_max_searches
 
         # The OpenAI client is created on the BACKEND because the API key must
         # never be shipped to the browser. The frontend only ever talks to our
@@ -307,16 +347,84 @@ class OpenAILLM:
             served_model=getattr(response, "model", None),
         )
 
-    def stream(self, history: list[HistoryMessage]) -> AsyncIterator[LLMEvent]:
-        """Streaming with bounded, safe retries (see stream_with_retry)."""
-        return stream_with_retry(
-            lambda: self._stream_once(history),
-            max_attempts=self._max_attempts,
-            base_delay=self._retry_base_delay,
-        )
+    def stream(self, history: list[HistoryMessage], tools: ToolExecutor | None = None) -> AsyncIterator[LLMEvent]:
+        """One reply as a stream of events. With `tools`, the model may call them in
+        a bounded loop (see _stream_agent); without, it is a single streamed call."""
+        return self._stream_agent(history, tools)
 
-    async def _stream_once(self, history: list[HistoryMessage]) -> AsyncIterator[LLMEvent]:
-        """ONE attempt at a streaming request: same call, but `stream=True`.
+    async def _stream_agent(
+        self, history: list[HistoryMessage], tools: ToolExecutor | None
+    ) -> AsyncIterator[LLMEvent]:
+        """The agent loop:  model -> (tool calls?) -> run tools -> model -> ... -> answer.
+
+        Each round is one streamed request. Text deltas are forwarded the moment they
+        arrive. If the round ENDS with function calls we run them, append the model's
+        output items plus a `function_call_output` for each call to the input, and ask
+        again. Once `agent_max_searches` tool calls have run, the next request sets
+        tool_choice="none", so the model must answer with what it has. (A round may
+        contain several parallel calls; any beyond the cap are answered with an error
+        message instead of being run.)
+
+        Retries wrap each ROUND, never the whole loop, and tools only run after a round
+        has completed: a retried round can never repeat a search.
+        Usage is summed over rounds; if any round reported none, the total is unknown
+        (None), because a partial sum would under-report cost.
+        """
+        input_items: list[dict[str, Any]] = list(to_openai_input(history))
+        total: Usage | None = None
+        usage_known = True
+        served_model: str | None = None
+        calls_made = 0
+
+        while True:
+            must_answer = tools is None or calls_made >= self._max_searches
+            end: _RoundEnd | None = None
+            async with aclosing(
+                stream_with_retry(
+                    lambda: self._stream_once(input_items, tools, tool_choice_none=must_answer and tools is not None),
+                    max_attempts=self._max_attempts,
+                    base_delay=self._retry_base_delay,
+                )
+            ) as events:
+                async for event in events:
+                    if isinstance(event, _RoundEnd):
+                        end = event
+                    else:
+                        yield event
+            assert end is not None  # _stream_once raises instead of ending without one
+
+            served_model = end.served_model or served_model
+            if end.usage is None:
+                usage_known = False
+            elif usage_known:
+                total = end.usage if total is None else total + end.usage
+
+            if must_answer or not end.calls or end.stop_reason != "completed":
+                yield Completed(end.stop_reason, total if usage_known else None, served_model)
+                return
+
+            input_items.extend(end.output_items)
+            for call in end.calls:
+                if calls_made >= self._max_searches:
+                    # Over the cap inside one parallel batch: every call still needs an output.
+                    input_items.append(
+                        {"type": "function_call_output", "call_id": call["call_id"],
+                         "output": "Error: the search limit for this reply was reached. Answer with what you have."}
+                    )
+                    continue
+                calls_made += 1
+                query = _call_query(call["arguments"])
+                yield ToolCallStarted(call["call_id"], call["name"], query)
+                outcome = await tools.run(call["name"], call["arguments"])  # type: ignore[union-attr]
+                yield ToolCallFinished(call["call_id"], call["name"], tuple(outcome.sources), outcome.error)
+                input_items.append(
+                    {"type": "function_call_output", "call_id": call["call_id"], "output": outcome.model_text}
+                )
+
+    async def _stream_once(
+        self, input_items: list[dict[str, Any]], tools: ToolExecutor | None, *, tool_choice_none: bool = False
+    ) -> AsyncIterator[LLMEvent | _RoundEnd]:
+        """ONE attempt at ONE streaming request: same call, but `stream=True`.
 
         Normal:    request -> wait for the WHOLE generation -> one big response
         Streaming: request -> delta, delta, delta, ... -> final "completed" event
@@ -328,19 +436,31 @@ class OpenAILLM:
         answer takes ten: it improves PERCEIVED latency (time to first token),
         not total generation time.
         """
+        extra: dict[str, Any] = {}
+        instructions = self._instructions
+        if tools is not None:
+            instructions = f"{instructions}\n\n{tools.instructions}"
+            extra["tools"] = tools.definitions
+            # store=False means nothing is kept at OpenAI, so reasoning items must travel
+            # back WITH the request when we continue after a tool call.
+            extra["include"] = ["reasoning.encrypted_content"]
+            if tool_choice_none:
+                extra["tool_choice"] = "none"
+
         stream = None
         try:
             stream = await self._client.responses.create(
                 model=self.model,
-                instructions=self._instructions,
-                input=to_openai_input(history),
+                instructions=instructions,
+                input=input_items,
                 max_output_tokens=self._max_output_tokens,
                 store=False,
                 stream=True,
+                **extra,
             )
             # The SDK gives us typed events. The ones we care about:
             #   response.output_text.delta -> a new piece of text
-            #   response.completed         -> finished; carries final usage
+            #   response.completed         -> finished; carries final usage + output items
             #   response.incomplete        -> stopped early (e.g. max_output_tokens)
             #   response.failed / error    -> the generation broke
             # Everything else (response.created, output_item.added, ...) is
@@ -350,10 +470,13 @@ class OpenAILLM:
                 if kind == "response.output_text.delta":
                     yield TextDelta(event.delta)
                 elif kind in ("response.completed", "response.incomplete"):
-                    yield Completed(
+                    items, calls = _output_items(event.response)
+                    yield _RoundEnd(
                         _stop_reason(event.response),
                         parse_usage(event.response.usage),
                         getattr(event.response, "model", None),
+                        items,
+                        calls,
                     )
                     return
                 elif kind == "response.failed":
@@ -402,6 +525,30 @@ class OpenAILLM:
             log.warning("title_generation_failed error_type=%s", type(exc).__name__)
             return None
         return clean_title(response.output_text)
+
+
+def _output_items(response: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """The response's output items as plain dicts (to send back as input), plus the
+    function calls among them. Missing/empty output -> nothing."""
+    items: list[dict[str, Any]] = []
+    calls: list[dict[str, str]] = []
+    for item in getattr(response, "output", None) or []:
+        if hasattr(item, "model_dump"):
+            data = item.model_dump(mode="json", exclude_none=True, by_alias=True)
+        else:
+            data = dict(item) if isinstance(item, dict) else dict(vars(item))
+        items.append(data)
+        if data.get("type") == "function_call":
+            calls.append({"call_id": data["call_id"], "name": data["name"], "arguments": data.get("arguments") or "{}"})
+    return items, calls
+
+
+def _call_query(arguments: str) -> str | None:
+    try:
+        value = json.loads(arguments).get("query")
+    except (ValueError, AttributeError):
+        return None
+    return value if isinstance(value, str) else None
 
 
 def _failed_response_error(error: Any) -> LLMError:

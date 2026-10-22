@@ -6,15 +6,26 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { formatMoney, formatMs } from "./format";
-import { CheckIcon, CopyIcon } from "./Icons";
+import { CheckIcon, CopyIcon, GlobeIcon } from "./Icons";
 import { normalizeMath } from "./math";
 import { describeRate, useRateInfo, useUsdToInr } from "./rate";
-import type { Message as MessageModel } from "./types";
+import { linkCitations } from "./cite";
+import type { Message as MessageModel, Source } from "./types";
 
 /** A message plus UI-only state that is not stored in the database. */
 export interface ViewMessage extends MessageModel {
   /** Safe error text the server sent in an SSE `error` event (this session only). */
   errorMessage?: string;
+  /** Live web-search activity of this reply (this session only; the sources themselves are stored). */
+  toolSteps?: ToolStep[];
+}
+
+export interface ToolStep {
+  id: string;
+  query: string | null;
+  status: "running" | "done" | "error";
+  count?: number;
+  error?: string | null;
 }
 
 export default function Message({ message }: { message: ViewMessage }) {
@@ -23,8 +34,10 @@ export default function Message({ message }: { message: ViewMessage }) {
 
   return (
     <article className={`msg msg-${message.role} status-${message.status}`}>
+      {isAssistant && message.toolSteps && message.toolSteps.length > 0 && <ToolSteps steps={message.toolSteps} />}
+
       <div className="msg-body">
-        {isStreaming && message.content === "" ? (
+        {isStreaming && message.content === "" && !message.toolSteps?.some((t) => t.status === "running") ? (
           // Loading state: request sent, no token has arrived yet.
           <span className="thinking" aria-live="polite">
             <i /> <i /> <i />
@@ -41,9 +54,11 @@ export default function Message({ message }: { message: ViewMessage }) {
           // plain: people don't expect their own message to be reformatted.)
           <div className="plain">{message.content}</div>
         ) : (
-          <SafeMarkdown text={message.content} />
+          <SafeMarkdown text={message.content} sources={message.sources} />
         )}
       </div>
+
+      {isAssistant && message.sources.length > 0 && <Sources sources={message.sources} />}
 
       {isAssistant && <Notices message={message} />}
       {isAssistant && !isStreaming && (
@@ -109,7 +124,7 @@ function CodeBlock({ node, children }: { node?: HastNode; children?: ReactNode }
  *    chat contents via prompt injection.
  *  - Links open in a new tab with rel=noopener noreferrer.
  */
-function SafeMarkdown({ text }: { text: string }) {
+function SafeMarkdown({ text, sources }: { text: string; sources: Source[] }) {
   return (
     <Markdown
       // singleDollarTextMath off: "costs $5 and $6" must stay text. Math arrives as \( \) / \[ \],
@@ -118,12 +133,78 @@ function SafeMarkdown({ text }: { text: string }) {
       rehypePlugins={[[rehypeKatex, { throwOnError: false }], [rehypeHighlight, { detect: false }]]}
       disallowedElements={["img"]}
       components={{
-        a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+        a: ({ node: _node, href, children, ...props }) => {
+          // [n] markers were rewritten to #cite-n by linkCitations: show a chip that opens the real source.
+          const cited = href?.startsWith("#cite-") ? sources.find((s) => s.n === Number(href.slice(6))) : undefined;
+          if (cited) {
+            return (
+              <a className="cite" href={safeUrl(cited.url)} target="_blank" rel="noopener noreferrer" title={`${cited.title}, ${hostOf(cited.url)}`}>
+                {children}
+              </a>
+            );
+          }
+          return <a {...props} href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
+        },
         pre: ({ node, children }) => <CodeBlock node={node as HastNode | undefined}>{children}</CodeBlock>,
       }}
     >
-      {normalizeMath(text)}
+      {linkCitations(normalizeMath(text), sources.length)}
     </Markdown>
+  );
+}
+
+const hostOf = (url: string) => {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+};
+
+/** Only http(s) URLs become links (the server also filters, but the UI doesn't rely on that). */
+const safeUrl = (url: string) => (/^https?:\/\//i.test(url) ? url : undefined);
+
+/** "Searching the web for ..." rows: live while the model works, a summary afterwards. */
+function ToolSteps({ steps }: { steps: ToolStep[] }) {
+  return (
+    <div className="tool-steps" aria-live="polite">
+      {steps.map((t) => (
+        <div key={t.id} className={`tool-step tool-${t.status}`}>
+          <GlobeIcon />
+          {t.status === "running" ? (
+            <span>
+              Searching the web{t.query ? <> for “{t.query}”</> : ""}
+              <i className="dots" />
+            </span>
+          ) : t.status === "error" ? (
+            <span>Search failed: {t.error}</span>
+          ) : (
+            <span>
+              Searched{t.query ? <> “{t.query}”</> : ""} · {t.count} {t.count === 1 ? "source" : "sources"}
+            </span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Sources({ sources }: { sources: Source[] }) {
+  return (
+    <div className="sources">
+      <div className="sources-title">Sources</div>
+      <ol>
+        {sources.map((s) => (
+          <li key={s.n}>
+            <a href={safeUrl(s.url)} target="_blank" rel="noopener noreferrer" title={s.snippet || s.title}>
+              <span className="src-n">{s.n}</span>
+              <span className="src-title">{s.title}</span>
+              <span className="src-host">{hostOf(s.url)}</span>
+            </a>
+          </li>
+        ))}
+      </ol>
+    </div>
   );
 }
 
@@ -182,6 +263,11 @@ function Stats({ message }: { message: ViewMessage }) {
           <span title={`USD calculated from the reported usage and AI/data/prices.toml. ${describeRate(rateInfo)}`}>
             <b>{formatMoney(message.cost_usd, rate)}</b>
           </span>
+          {message.web_searches ? (
+            <span title="Web searches the model ran for this reply">
+              <b>{message.web_searches}</b> web {message.web_searches === 1 ? "search" : "searches"}
+            </span>
+          ) : null}
         </>
       ) : (
         <span title="OpenAI reported no usage for this reply (for example it was stopped or failed before finishing)">

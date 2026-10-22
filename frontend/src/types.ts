@@ -2,6 +2,14 @@
 
 export type MessageStatus = "streaming" | "complete" | "cancelled" | "error";
 
+/** A web page the model searched up; the reply cites it as [n]. */
+export interface Source {
+  n: number;
+  title: string;
+  url: string;
+  snippet: string;
+}
+
 export interface Message {
   id: string;
   role: "user" | "assistant";
@@ -24,6 +32,8 @@ export interface Message {
   served_model: string | null;
   ttft_ms: number | null;
   latency_ms: number | null;
+  sources: Source[];
+  web_searches: number | null;
   created_at: string;
 }
 
@@ -79,11 +89,23 @@ export interface DoneEvent {
   served_model: string | null;
   ttft_ms: number | null;
   latency_ms: number | null;
+  web_searches: number;
   conversation_total_cost_usd: number;
   conversation_total_tokens: number;
   conversation_total_input_tokens: number;
   conversation_total_output_tokens: number;
   unpriced_messages: number;
+}
+export interface ToolCallEvent {
+  id: string;
+  name: string;
+  query: string | null;
+}
+export interface ToolResultEvent {
+  id: string;
+  name: string;
+  sources: Source[];
+  error: string | null;
 }
 export interface ErrorEvent {
   message: string;
@@ -96,6 +118,8 @@ export interface TitleEvent {
 export interface StreamHandlers {
   onStart?: (e: StartEvent) => void;
   onDelta?: (e: DeltaEvent) => void;
+  onToolCall?: (e: ToolCallEvent) => void;
+  onToolResult?: (e: ToolResultEvent) => void;
   onDone?: (e: DoneEvent) => void;
   onError?: (e: ErrorEvent) => void;
   onTitle?: (e: TitleEvent) => void;

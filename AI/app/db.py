@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS messages (
     served_model      TEXT,     -- model id OpenAI reports it actually served (may be a snapshot)
     ttft_ms           REAL,     -- time to first token (NULL if none arrived)
     latency_ms        REAL,     -- total time until the reply finished
+    sources           TEXT,     -- JSON list of web sources cited by this reply (NULL = none)
+    web_searches      INTEGER,  -- how many web searches this reply ran
     created_at        TEXT NOT NULL
 );
 
@@ -92,7 +94,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_streaming
 _UPDATABLE = {
     "content", "status", "input_tokens", "cached_input_tokens", "output_tokens",
     "reasoning_tokens", "total_tokens", "cost_usd", "stop_reason", "model",
-    "served_model", "ttft_ms", "latency_ms",
+    "served_model", "ttft_ms", "latency_ms", "sources", "web_searches",
 }
 
 # Columns added after the first release. CREATE TABLE IF NOT EXISTS does not alter
@@ -102,6 +104,8 @@ _ADDED_COLUMNS = {
         "cached_input_tokens": "INTEGER",
         "reasoning_tokens": "INTEGER",
         "served_model": "TEXT",
+        "sources": "TEXT",
+        "web_searches": "INTEGER",
     },
 }
 

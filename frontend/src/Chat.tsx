@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, createConversation, getConversation, streamMessage } from "./api";
 import { formatMoney } from "./format";
-import { describeRate, useRateInfo, useUsdToInr } from "./rate";
-import { ArrowDownIcon, LogoMark, SendIcon, StopIcon } from "./Icons";
+import { describeRate, useRateInfo, useUsdToInr, useWebSearchAvailable } from "./rate";
+import { ArrowDownIcon, GlobeIcon, LogoMark, SendIcon, StopIcon } from "./Icons";
 import Message, { type ViewMessage } from "./Message";
 import type { Conversation } from "./types";
 
@@ -44,12 +44,26 @@ const tempMessage = (role: "user" | "assistant", content: string): ViewMessage =
   served_model: null,
   ttft_ms: null,
   latency_ms: null,
+  sources: [],
+  web_searches: null,
   created_at: new Date().toISOString(),
 });
+
+// Remembered per browser; failing to read/write it must never break the chat.
+const SEARCH_KEY = "web-search";
+const readSearchPref = () => {
+  try {
+    return localStorage.getItem(SEARCH_KEY) !== "off";
+  } catch {
+    return true;
+  }
+};
 
 export default function Chat({ conversationId, onCreated, onTitle, onActivity }: Props) {
   const rate = useUsdToInr();
   const rateInfo = useRateInfo();
+  const searchAvailable = useWebSearchAvailable();
+  const [webSearch, setWebSearch] = useState(readSearchPref);
   const [messages, setMessages] = useState<ViewMessage[]>([]);
   const [title, setTitle] = useState("");
   const [totals, setTotals] = useState({ cost: 0, tokens: 0, input: 0, output: 0, unpriced: 0 });
@@ -205,6 +219,21 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
           // `delta`: append the new text immediately. THIS is what makes the
           // answer appear to be typed out live.
           onDelta: (e) => patchAssistant((m) => ({ content: m.content + e.text })),
+          // The model decided to search: show it live ("Searching the web for ...").
+          onToolCall: (e) =>
+            patchAssistant((m) => ({
+              toolSteps: [...(m.toolSteps ?? []), { id: e.id, query: e.query, status: "running" as const }],
+            })),
+          // The search came back: remember its sources (the answer will cite them as [n]).
+          onToolResult: (e) =>
+            patchAssistant((m) => ({
+              sources: [...m.sources, ...e.sources],
+              toolSteps: (m.toolSteps ?? []).map((t) =>
+                t.id === e.id
+                  ? { ...t, status: e.error ? ("error" as const) : ("done" as const), count: e.sources.length, error: e.error }
+                  : t,
+              ),
+            })),
           // `done`: the reply is final. Stop loading, record tokens and cost.
           onDone: (e) => {
             patchAssistant(() => ({
@@ -221,6 +250,7 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
               served_model: e.served_model,
               ttft_ms: e.ttft_ms,
               latency_ms: e.latency_ms,
+              web_searches: e.web_searches || null,
             }));
             setTotals({
               cost: e.conversation_total_cost_usd,
@@ -238,6 +268,7 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
           },
         },
         controller.signal,
+        webSearch && searchAvailable,
       );
     } catch (err) {
       const started = assistantId !== tmpAssistant.id; // did the server acknowledge us?
@@ -392,6 +423,26 @@ export default function Chat({ conversationId, onCreated, onTitle, onActivity }:
             disabled={load !== "ready"}
             aria-label="Message"
           />
+          {searchAvailable && (
+            <button
+              type="button"
+              className={`search-toggle ${webSearch ? "on" : ""}`}
+              aria-pressed={webSearch}
+              title={webSearch ? "Web search is on: the model can look things up and cite sources" : "Web search is off"}
+              onClick={() =>
+                setWebSearch((on) => {
+                  try {
+                    localStorage.setItem(SEARCH_KEY, on ? "off" : "on");
+                  } catch {
+                    /* preference just won't persist */
+                  }
+                  return !on;
+                })
+              }
+            >
+              <GlobeIcon /> <span>Search</span>
+            </button>
+          )}
           {streaming ? (
             <button type="button" className="send send-stop" onClick={stop} title="Stop (Esc)" aria-label="Stop generating">
               <StopIcon />

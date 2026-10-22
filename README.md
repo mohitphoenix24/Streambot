@@ -1,6 +1,6 @@
 # Streaming Chat
 
-A small but production-shaped LLM chat product, built from scratch to understand how an LLM application really works: **FastAPI + OpenAI Responses API + Server-Sent Events + SQLite + React/TypeScript**. No LangChain, no agent framework, no abstraction layer. The OpenAI SDK is used directly so every important step is visible.
+A small but production-shaped LLM chat product, built from scratch to understand how an LLM application really works: **FastAPI + OpenAI Responses API + Server-Sent Events + SQLite + React/TypeScript**. No LangChain, no agent framework, no abstraction layer. The OpenAI SDK is used directly so every important step is visible, including the tool-calling loop that lets the model search the web and cite its sources.
 
 ```
 User → React → HTTP POST → FastAPI → conversation history (SQLite)
@@ -89,7 +89,7 @@ Because `app/llm/client.py` is the *only* module that imports `openai`, the rest
 
 **Backend:** Python 3.10+, FastAPI, Uvicorn, official OpenAI Python SDK (Responses API), SQLite (stdlib `sqlite3`), Pydantic, pytest.
 **Frontend:** React 19, TypeScript, Vite, `react-markdown` (the only runtime dependency beyond React), Vitest.
-**Not used (on purpose):** LangChain, LangGraph, Anthropic, Redis, Kafka, vector DBs, auth, agents.
+**Not used (on purpose):** LangChain, LangGraph, Anthropic, Redis, Kafka, vector DBs, auth. (The agent loop is hand-written in `app/llm/client.py`.)
 
 ## Project structure
 
@@ -109,6 +109,9 @@ Streaming-Chat-App/
 │   │   │   ├── client.py     OpenAI Responses API: stream(), retry, error mapping, titles
 │   │   │   ├── usage.py      parse_usage(): provider-reported token usage
 │   │   │   └── pricing.py    PriceTable, cost = tokens × price / 1M (None if unpriced)
+│   │   ├── tools/
+│   │   │   ├── web_search.py  Tavily search -> numbered sources (safe errors, http(s) URLs only)
+│   │   │   └── registry.py    web_search tool definition + per-reply ToolRunner (citation numbering)
 │   │   └── core/
 │   │       ├── limits.py     BodySizeLimitMiddleware, SlidingWindowLimiter
 │   │       └── fx.py         USD→INR display rate
@@ -167,6 +170,26 @@ VITE_API_URL=http://localhost:8501 npm run dev -- --port 3100
 2. Add that model to `AI/data/prices.toml` (current price from OpenAI's pricing page) or costs will show as "cost n/a".
 3. Without a valid key/model the server **refuses to start** and says what to change.
 
+## Web search and citations
+
+The model can search the web by itself. It decides when (recent events, versions, prices), and a **Search** toggle next to the send button turns it off per browser. With no `TAVILY_API_KEY` the tool is not offered and the toggle is hidden.
+
+```
+Browser ── message ──▶ FastAPI ──▶ OpenAI (tools: web_search)
+                         ▲            │ function_call: web_search("...")
+                         │            ▼
+                         └── Tavily ◀── we run it (our key), number the results [1] [2] ...
+                                      │ function_call_output
+                                      ▼
+                      OpenAI ── answer with inline [1] [2] ──▶ SSE ──▶ browser (chips + source cards)
+```
+
+- The loop lives in `OpenAILLM._stream_agent`. Each round is one streamed request; when a round ends with a function call we run the tool, append the model's output items (including encrypted reasoning, needed because `store=False`) and a `function_call_output`, and ask again. After `AGENT_MAX_SEARCHES` searches the next request sets `tool_choice="none"`, so the model has to answer.
+- Retries wrap a single round and tools run only after a round completes, so a retried request never repeats a search. Token usage and cost are summed over all rounds.
+- The UI shows `tool_call`/`tool_result` live, then renders `[n]` as clickable chips and lists the sources under the reply. Sources are stored with the message (`messages.sources`), so they survive a refresh. Markers that match no source stay plain text.
+- Citation numbers belong to one reply. The system prompt tells the model never to reuse markers from earlier messages.
+- Search cost is counted (`web_searches` per reply), not priced.
+
 ## Environment variables
 
 See [.env.example](.env.example) for the annotated file.
@@ -176,6 +199,9 @@ See [.env.example](.env.example) for the annotated file.
 | `OPENAI_API_KEY` | – | secret; backend only |
 | `OPENAI_MODEL` | – | **required** (this project is configured with `gpt-5.6-luna` in `.env`); no default in code on purpose |
 | `OPENAI_TITLE_MODEL` | `OPENAI_MODEL` | cheaper model for titles (model routing) |
+| `TAVILY_API_KEY` | – | enables the web search tool; empty = tool not offered |
+| `WEB_SEARCH_MAX_RESULTS` | `5` | results the model gets per search |
+| `AGENT_MAX_SEARCHES` | `10` | max web searches per reply; after that the model must answer |
 | `OPENAI_TIMEOUT_S` | `60` | connect/inter-chunk timeout |
 | `MAX_OUTPUT_TOKENS` | `1024` | cap on generated tokens per reply |
 | `HISTORY_BUDGET_TOKENS` | `6000` | budget for past messages (not the context window) |
@@ -313,8 +339,10 @@ data: {"text": "Hello"}
 |---|---|---|
 | `start` | `user_message_id, assistant_message_id, history_messages, history_truncated` | swap temp ids for real ids; show truncation note |
 | `delta` | `{text}` | append text immediately |
-| `done` | `stop_reason, usage{input,cached_input,output,reasoning,total}, cost{input_cost,cached_input_cost,output_cost,total_cost}, requested_model, served_model, ttft_ms, latency_ms, conversation_total_*` (usage/cost are `null` when unavailable) | stop loading/Stop button, show tokens + cost, render Markdown |
+| `done` | `stop_reason, usage{input,cached_input,output,reasoning,total}, cost{input_cost,cached_input_cost,output_cost,total_cost}, requested_model, served_model, ttft_ms, latency_ms, web_searches, conversation_total_*` (usage/cost are `null` when unavailable) | stop loading/Stop button, show tokens + cost, render Markdown |
 | `error` | `{message, partial}` | keep partial text, show safe message |
+| `tool_call` | `{id, name, query}` | show "Searching the web for …" (the model asked for a search) |
+| `tool_result` | `{id, name, sources:[{n,title,url,snippet}], error}` | mark the search done; remember the sources for `[n]` citations |
 | `title` | `{title}` | update sidebar |
 
 ### Why `fetch()` and not `EventSource`
@@ -498,7 +526,8 @@ cd frontend && npm run typecheck && npm test                   # TS typecheck + 
 | `test_db.py` | create/get/update/list, FK + CHECK constraints, crash recovery, totals |
 | `test_streaming_failure.py` | **stream failure** (`"Hello "`, `"world"`, then raise → DB `"Hello world"` + `error` + SSE error event), no leaked internals, cancellation (disconnect + task cancel), checkpointing, placeholder row |
 | `test_retry.py` | retry before first token, **no retry after**, bounded, backoff, `Retry-After` |
-| `test_llm.py` | OpenAI adapter against a stub SDK client: request shape, event mapping, error classification |
+| `test_llm.py` | OpenAI adapter against a stub SDK client: request shape, event mapping, error classification, the agent loop (tool call → output → answer, summed usage, search cap, retries never repeat a search) |
+| `test_web_search.py` | Tavily parsing, URL filtering, safe errors, citation numbering across searches |
 | `test_api.py` | endpoints, history reaches the model, titles, 413/422/409/429, restart persistence |
 | `test_cancellation_live.py` | real Uvicorn + real TCP disconnect |
 | `test_limits_config.py` | rate limiter, config validation |

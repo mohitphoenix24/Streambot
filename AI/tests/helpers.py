@@ -26,9 +26,11 @@ class ScriptedLLM:
         self.histories: list[list[HistoryMessage]] = []  # what the app sent us, per call
         self.upstream_closed = False  # did the app close the provider stream?
         self.title_requests: list[str] = []
+        self.tools_seen: list = []  # the ToolExecutor (or None) passed for each reply
 
-    async def stream(self, history: list[HistoryMessage]) -> AsyncIterator[LLMEvent]:
+    async def stream(self, history: list[HistoryMessage], tools=None) -> AsyncIterator[LLMEvent]:
         self.histories.append(history)
+        self.tools_seen.append(tools)
         try:
             for item in self.script:
                 if isinstance(item, Exception):

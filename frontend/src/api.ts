@@ -8,6 +8,8 @@ import type {
   StartEvent,
   StreamHandlers,
   TitleEvent,
+  ToolCallEvent,
+  ToolResultEvent,
 } from "./types";
 
 // The browser only ever talks to OUR backend. There is no OpenAI key (or any
@@ -58,6 +60,7 @@ export interface Info {
   usd_to_inr: number | null;
   usd_to_inr_source: "live" | "fallback" | "fixed" | "off";
   usd_to_inr_as_of: string | null;
+  web_search_available: boolean;
 }
 export const getInfo = () => json<Info>("/info");
 
@@ -81,11 +84,12 @@ export async function streamMessage(
   text: string,
   handlers: StreamHandlers,
   signal: AbortSignal,
+  webSearch = true,
 ): Promise<void> {
   const res = await fetch(`${API_URL}/conversations/${conversationId}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text, web_search: webSearch }),
     signal,
   });
   if (!res.ok) throw await readError(res);
@@ -112,6 +116,12 @@ export async function streamMessage(
             break;
           case "delta":
             handlers.onDelta?.(payload as DeltaEvent);
+            break;
+          case "tool_call":
+            handlers.onToolCall?.(payload as ToolCallEvent);
+            break;
+          case "tool_result":
+            handlers.onToolResult?.(payload as ToolResultEvent);
             break;
           case "title":
             handlers.onTitle?.(payload as TitleEvent);

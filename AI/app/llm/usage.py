@@ -47,6 +47,22 @@ class Usage:
             "total_tokens": self.total_tokens,
         }
 
+    def __add__(self, other: "Usage") -> "Usage":
+        """Sum two REPORTED usages (the rounds of one tool-using reply are billed separately).
+
+        cached/reasoning stay None only when neither side reported them.
+        """
+        def both(a: int | None, b: int | None) -> int | None:
+            return None if a is None and b is None else (a or 0) + (b or 0)
+
+        return Usage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+            cached_input_tokens=both(self.cached_input_tokens, other.cached_input_tokens),
+            reasoning_tokens=both(self.reasoning_tokens, other.reasoning_tokens),
+        )
+
 
 def _get(obj: Any, name: str) -> Any:
     """Read a field from an SDK object OR a plain dict; missing -> None."""

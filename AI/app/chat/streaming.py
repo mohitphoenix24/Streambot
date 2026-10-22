@@ -15,6 +15,7 @@ The whole request, end to end (this is the whiteboard diagram):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from contextlib import aclosing
@@ -26,7 +27,10 @@ from fastapi import Request
 from app.config import Settings
 from app.db import Database
 from app.chat.history import build_history
-from app.llm.client import LLM, UNAVAILABLE, Completed, HistoryMessage, LLMError, TextDelta, Usage
+from app.llm.client import (
+    LLM, UNAVAILABLE, Completed, HistoryMessage, LLMError, TextDelta, ToolCallFinished,
+    ToolCallStarted, ToolExecutor, Usage,
+)
 from app.llm.pricing import CostBreakdown, PriceTable
 from app.chat.sse import sse
 
@@ -87,6 +91,14 @@ def usage_columns(usage: Usage | None) -> dict[str, int | None]:
     }
 
 
+def web_columns(sources: list[dict[str, Any]] | None, web_searches: int) -> dict[str, Any]:
+    """DB columns for what web search contributed. No sources / searches -> NULL."""
+    return {
+        "sources": json.dumps(sources) if sources else None,
+        "web_searches": web_searches or None,
+    }
+
+
 def finalize_complete(
     db: Database,
     prices: PriceTable,
@@ -99,6 +111,8 @@ def finalize_complete(
     usage: Usage | None,
     ttft_ms: float | None,
     latency_ms: float,
+    sources: list[dict[str, Any]] | None = None,
+    web_searches: int = 0,
 ) -> CostBreakdown | None:
     """Write the final state of a successful reply. Returns the cost breakdown.
 
@@ -120,6 +134,7 @@ def finalize_complete(
         cost_usd=cost.total_cost if cost else None,
         ttft_ms=ttft_ms,
         latency_ms=latency_ms,
+        **web_columns(sources, web_searches),
         **usage_columns(usage),
     )
     return cost
@@ -147,6 +162,7 @@ async def stream_reply(
     prices: PriceTable,
     turn: Turn,
     started_at: float,
+    tools: ToolExecutor | None = None,
 ) -> AsyncIterator[str]:
     """Async generator yielding SSE-formatted strings. FastAPI's StreamingResponse
     sends each yielded string to the browser as soon as it is produced.
@@ -164,6 +180,8 @@ async def stream_reply(
     ttft_ms: float | None = None
     completed: Completed | None = None
     public_error: str | None = None
+    sources: list[dict[str, Any]] = []  # web sources cited so far, numbered [1].. across searches
+    web_searches = 0
 
     # Assume 'cancelled' unless we positively reach success or a handled error.
     # Anything else that unwinds this generator (client disconnect, task
@@ -182,7 +200,8 @@ async def stream_reply(
         # aclosing() guarantees the upstream stream is closed when we leave this
         # block early, which closes the HTTP connection to OpenAI so it stops
         # generating (and billing) tokens nobody is reading.
-        async with aclosing(llm.stream(turn.history)) as events:
+        upstream = llm.stream(turn.history, tools) if tools is not None else llm.stream(turn.history)
+        async with aclosing(upstream) as events:
             async for event in events:
                 # CANCELLATION, signal 1: ask the server whether the browser is
                 # still there. When the user clicks Stop, AbortController.abort()
@@ -214,6 +233,18 @@ async def stream_reply(
                         last_flush = now
 
                     yield sse("delta", {"text": event.text})
+                elif isinstance(event, ToolCallStarted):
+                    yield sse("tool_call", {"id": event.call_id, "name": event.name, "query": event.query})
+                elif isinstance(event, ToolCallFinished):
+                    if not event.error:
+                        web_searches += 1
+                    sources.extend(event.sources)
+                    # Checkpoint right away so a crash keeps what the answer will cite.
+                    db.update_message(assistant_id, **web_columns(sources, web_searches))
+                    yield sse("tool_result", {
+                        "id": event.call_id, "name": event.name,
+                        "sources": list(event.sources), "error": event.error,
+                    })
                 elif isinstance(event, Completed):
                     completed = event
             else:
@@ -251,7 +282,7 @@ async def stream_reply(
                 db, prices, assistant_id=assistant_id, model=llm.model,
                 served_model=completed.served_model, content=content,
                 stop_reason=completed.stop_reason, usage=completed.usage,
-                ttft_ms=ttft_ms, latency_ms=latency_ms,
+                ttft_ms=ttft_ms, latency_ms=latency_ms, sources=sources, web_searches=web_searches,
             )
         else:
             # error / cancelled: keep whatever text arrived. We never replace it with blank.
@@ -266,16 +297,17 @@ async def stream_reply(
                 assistant_id, content=content, status=outcome, stop_reason=outcome,
                 served_model=served,
                 cost_usd=partial_cost.total_cost if partial_cost else None,
-                ttft_ms=ttft_ms, latency_ms=latency_ms, **usage_columns(reported),
+                ttft_ms=ttft_ms, latency_ms=latency_ms, **web_columns(sources, web_searches),
+                **usage_columns(reported),
             )
         db.touch_conversation(conversation_id)
         usage = completed.usage if completed else None
         log.info(
             "reply_finished conversation_id=%s message_id=%s model=%s served_model=%s status=%s "
-            "stop_reason=%s input_tokens=%s cached_input_tokens=%s output_tokens=%s "
+            "stop_reason=%s web_searches=%d input_tokens=%s cached_input_tokens=%s output_tokens=%s "
             "reasoning_tokens=%s cost_usd=%s ttft_ms=%s latency_ms=%s output_chars=%d",
             conversation_id, assistant_id, llm.model, completed.served_model if completed else None,
-            outcome, completed.stop_reason if completed else outcome,
+            outcome, completed.stop_reason if completed else outcome, web_searches,
             usage.input_tokens if usage else None, usage.cached_input_tokens if usage else None,
             usage.output_tokens if usage else None, usage.reasoning_tokens if usage else None,
             cost.total_cost if cost else None, ttft_ms, latency_ms, len(content),
@@ -300,6 +332,7 @@ async def stream_reply(
         "served_model": completed.served_model,
         "ttft_ms": ttft_ms,
         "latency_ms": latency_ms,
+        "web_searches": web_searches,
         "conversation_total_cost_usd": totals["total_cost_usd"],
         "conversation_total_tokens": totals["total_tokens"],
         "conversation_total_input_tokens": totals["total_input_tokens"],

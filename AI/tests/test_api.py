@@ -54,7 +54,8 @@ def test_unknown_conversation_is_404(make_client):
 def test_info_reports_the_backend_and_model_but_no_secrets(make_client):
     body = make_client().get("/info").json()
     assert body == {"model": "test-model", "usd_to_inr": 88.0,
-                    "usd_to_inr_source": "fixed", "usd_to_inr_as_of": None}
+                    "usd_to_inr_source": "fixed", "usd_to_inr_as_of": None,
+                    "web_search_available": False}
     hidden = make_client(usd_to_inr=0).get("/info").json()
     assert (hidden["usd_to_inr"], hidden["usd_to_inr_source"]) == (None, "off")  # 0 hides INR
 
@@ -222,3 +223,77 @@ def test_cors_allows_the_frontend_origin_only(make_client):
     bad = client.options("/conversations", headers={"Origin": "http://evil.example", "Access-Control-Request-Method": "POST"})
     assert ok.headers.get("access-control-allow-origin") == "http://localhost:5173"
     assert "access-control-allow-origin" not in bad.headers
+
+
+# ── web search tool ──────────────────────────────────────────────────────
+from app.llm.client import Completed, TextDelta, ToolCallFinished, ToolCallStarted  # noqa: E402
+from app.tools.web_search import TavilySearch  # noqa: E402
+
+SRC = {"n": 1, "title": "Python 3.14", "url": "https://python.org/news", "snippet": "released"}
+
+
+def search_tool():
+    async def fetch(query, n):
+        return {"results": []}
+    return TavilySearch("k", fetch=fetch)
+
+
+def tool_script(*after, error=None):
+    return [ToolCallStarted("c1", "web_search", "python release"),
+            ToolCallFinished("c1", "web_search", () if error else (SRC,), error), *after]
+
+
+def test_tool_events_stream_in_order_and_sources_are_persisted(make_client):
+    llm = ScriptedLLM(tool_script(TextDelta("Out now [1]"), Completed("completed", None)))
+    client = make_client(llm, search=search_tool())
+    cid = new_conversation(client)
+
+    events = parse_sse(send(client, cid).text)
+    assert [name for name, _ in events] == ["start", "tool_call", "tool_result", "delta", "done", "title"]
+    data = dict(events)
+    assert data["tool_call"] == {"id": "c1", "name": "web_search", "query": "python release"}
+    assert data["tool_result"]["sources"] == [SRC] and data["tool_result"]["error"] is None
+    assert data["done"]["web_searches"] == 1
+
+    reply = client.get(f"/conversations/{cid}").json()["messages"][-1]
+    assert reply["sources"] == [SRC] and reply["web_searches"] == 1 and reply["content"] == "Out now [1]"
+
+
+def test_sources_are_kept_when_the_reply_fails_afterwards(make_client):
+    llm = ScriptedLLM(tool_script(TextDelta("partial"), RuntimeError("boom")))
+    client = make_client(llm, search=search_tool())
+    cid = new_conversation(client)
+    send(client, cid)
+    reply = client.get(f"/conversations/{cid}").json()["messages"][-1]
+    assert reply["status"] == "error" and reply["sources"] == [SRC] and reply["web_searches"] == 1
+
+
+def test_a_failed_search_is_reported_but_not_counted(make_client):
+    llm = ScriptedLLM(tool_script(TextDelta("answer"), Completed("completed", None), error="Web search is unavailable right now."))
+    client = make_client(llm, search=search_tool())
+    cid = new_conversation(client)
+    events = dict(parse_sse(send(client, cid).text))
+    assert events["tool_result"]["error"] == "Web search is unavailable right now."
+    assert events["done"]["web_searches"] == 0
+    reply = client.get(f"/conversations/{cid}").json()["messages"][-1]
+    assert reply["sources"] == [] and reply["web_searches"] is None and reply["status"] == "complete"
+
+
+def test_the_toggle_and_the_api_key_control_whether_tools_are_offered(make_client):
+    llm = ScriptedLLM(ok_script("x"))
+    with_key = make_client(llm, search=search_tool())
+    cid = new_conversation(with_key)
+    with_key.post(f"/conversations/{cid}/messages", json={"text": "a"})  # default: on
+    with_key.post(f"/conversations/{cid}/messages", json={"text": "b", "web_search": False})
+    assert [t is not None for t in llm.tools_seen] == [True, False]
+
+    no_key = ScriptedLLM(ok_script("x"))
+    client = make_client(no_key)  # no search configured
+    cid = new_conversation(client)
+    client.post(f"/conversations/{cid}/messages", json={"text": "a"})
+    assert no_key.tools_seen == [None]
+
+
+def test_info_says_whether_web_search_is_available(make_client):
+    assert make_client(search=search_tool()).get("/info").json()["web_search_available"] is True
+    assert make_client().get("/info").json()["web_search_available"] is False

@@ -44,9 +44,9 @@ def settings(tmp_path):
 def make_client(settings):
     clients = []
 
-    def _make(llm=None, **overrides):
+    def _make(llm=None, search=None, **overrides):
         s = Settings(**{**settings.__dict__, **overrides})
-        client = TestClient(create_app(s, llm or ScriptedLLM(ok_script("hi"))))
+        client = TestClient(create_app(s, llm or ScriptedLLM(ok_script("hi")), search=search))
         client.__enter__()  # runs lifespan: schema creation + crash recovery
         clients.append(client)
         return client
