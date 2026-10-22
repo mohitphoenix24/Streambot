@@ -333,29 +333,6 @@ async def test_usage_is_unknown_if_any_round_reported_none(llm_factory):
     assert events[-1].usage is None  # a partial sum would under-report cost
 
 
-async def test_round_cap_forces_an_answer(llm_factory):
-    # cap = 1 search: the 2nd request must forbid further tool calls
-    client = client_with(
-        StubStream([round_end(fn_call())]),
-        StubStream([delta("final"), round_end()]),
-    )
-    events, _ = await collect_with_tools(llm_factory(client, agent_max_searches=1), FakeTools())
-    first, second = client.responses.calls
-    assert "tool_choice" not in first and second["tool_choice"] == "none"
-    assert second["tools"] == FakeTools.definitions  # same tool list keeps the prompt prefix identical
-    assert isinstance(events[-1], Completed)
-
-
-async def test_even_if_the_model_calls_a_tool_at_the_cap_it_is_not_run(llm_factory):
-    client = client_with(
-        StubStream([round_end(fn_call())]),
-        StubStream([round_end(fn_call("call_2"))]),  # disobeys tool_choice=none
-    )
-    tools = FakeTools()
-    events, _ = await collect_with_tools(llm_factory(client, agent_max_searches=1), tools)
-    assert len(tools.calls) == 1 and isinstance(events[-1], Completed)
-
-
 async def test_a_retried_round_never_repeats_the_search(llm_factory):
     client = client_with(
         StubStream([round_end(fn_call())]),
@@ -394,22 +371,25 @@ async def test_without_tools_the_request_is_exactly_as_before(llm_factory):
     assert call["instructions"] == "BE NICE"
 
 
-async def test_default_cap_is_ten_searches_per_reply():
-    assert Settings().agent_max_searches == 10
+async def test_there_is_no_limit_on_how_many_searches_a_reply_makes(llm_factory):
+    # 12 sequential search rounds, then an answer: every search runs, nothing forces an early stop
+    rounds = [StubStream([round_end(fn_call(f"call_{i}"))]) for i in range(12)]
+    client = client_with(*rounds, StubStream([delta("finally"), round_end()]))
+    tools = FakeTools()
+    events, error = await collect_with_tools(llm_factory(client), tools)
+
+    assert error is None and len(tools.calls) == 12
+    assert all("tool_choice" not in call for call in client.responses.calls)
+    assert events[-2] == TextDelta("finally") and isinstance(events[-1], Completed)
 
 
-async def test_parallel_calls_beyond_the_cap_are_answered_but_not_run(llm_factory):
+async def test_parallel_calls_in_one_round_all_run(llm_factory):
     client = client_with(
         StubStream([round_end(fn_call("c1"), fn_call("c2"), fn_call("c3"))]),
         StubStream([delta("done"), round_end()]),
     )
     tools = FakeTools()
-    events, error = await collect_with_tools(llm_factory(client, agent_max_searches=2), tools)
-
-    assert error is None and len(tools.calls) == 2  # only 2 of the 3 searches ran
-    second = client.responses.calls[1]
-    outputs = [i for i in second["input"] if i.get("type") == "function_call_output"]
-    assert [o["call_id"] for o in outputs] == ["c1", "c2", "c3"]  # the API requires an output for every call
-    assert "limit" in outputs[2]["output"]
-    assert second["tool_choice"] == "none"  # cap reached -> must answer
-    assert sum(isinstance(e, ToolCallStarted) for e in events) == 2
+    await collect_with_tools(llm_factory(client), tools)
+    assert len(tools.calls) == 3
+    outputs = [i for i in client.responses.calls[1]["input"] if i.get("type") == "function_call_output"]
+    assert [o["call_id"] for o in outputs] == ["c1", "c2", "c3"]

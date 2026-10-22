@@ -296,7 +296,6 @@ class OpenAILLM:
         self._max_output_tokens = settings.max_output_tokens
         self._max_attempts = settings.llm_max_attempts
         self._retry_base_delay = settings.retry_base_delay_s
-        self._max_searches = settings.agent_max_searches
 
         # The OpenAI client is created on the BACKEND because the API key must
         # never be shipped to the browser. The frontend only ever talks to our
@@ -360,10 +359,9 @@ class OpenAILLM:
         Each round is one streamed request. Text deltas are forwarded the moment they
         arrive. If the round ENDS with function calls we run them, append the model's
         output items plus a `function_call_output` for each call to the input, and ask
-        again. Once `agent_max_searches` tool calls have run, the next request sets
-        tool_choice="none", so the model must answer with what it has. (A round may
-        contain several parallel calls; any beyond the cap are answered with an error
-        message instead of being run.)
+        again, until a round ends with no function calls: that round is the answer.
+        There is deliberately no limit on the number of searches; the user can always
+        press Stop, and each round is still bounded by max_output_tokens.
 
         Retries wrap each ROUND, never the whole loop, and tools only run after a round
         has completed: a retried round can never repeat a search.
@@ -374,14 +372,12 @@ class OpenAILLM:
         total: Usage | None = None
         usage_known = True
         served_model: str | None = None
-        calls_made = 0
 
         while True:
-            must_answer = tools is None or calls_made >= self._max_searches
             end: _RoundEnd | None = None
             async with aclosing(
                 stream_with_retry(
-                    lambda: self._stream_once(input_items, tools, tool_choice_none=must_answer and tools is not None),
+                    lambda: self._stream_once(input_items, tools),
                     max_attempts=self._max_attempts,
                     base_delay=self._retry_base_delay,
                 )
@@ -399,20 +395,12 @@ class OpenAILLM:
             elif usage_known:
                 total = end.usage if total is None else total + end.usage
 
-            if must_answer or not end.calls or end.stop_reason != "completed":
+            if tools is None or not end.calls or end.stop_reason != "completed":
                 yield Completed(end.stop_reason, total if usage_known else None, served_model)
                 return
 
             input_items.extend(end.output_items)
             for call in end.calls:
-                if calls_made >= self._max_searches:
-                    # Over the cap inside one parallel batch: every call still needs an output.
-                    input_items.append(
-                        {"type": "function_call_output", "call_id": call["call_id"],
-                         "output": "Error: the search limit for this reply was reached. Answer with what you have."}
-                    )
-                    continue
-                calls_made += 1
                 query = _call_query(call["arguments"])
                 yield ToolCallStarted(call["call_id"], call["name"], query)
                 outcome = await tools.run(call["name"], call["arguments"])  # type: ignore[union-attr]
@@ -422,7 +410,7 @@ class OpenAILLM:
                 )
 
     async def _stream_once(
-        self, input_items: list[dict[str, Any]], tools: ToolExecutor | None, *, tool_choice_none: bool = False
+        self, input_items: list[dict[str, Any]], tools: ToolExecutor | None
     ) -> AsyncIterator[LLMEvent | _RoundEnd]:
         """ONE attempt at ONE streaming request: same call, but `stream=True`.
 
@@ -444,8 +432,6 @@ class OpenAILLM:
             # store=False means nothing is kept at OpenAI, so reasoning items must travel
             # back WITH the request when we continue after a tool call.
             extra["include"] = ["reasoning.encrypted_content"]
-            if tool_choice_none:
-                extra["tool_choice"] = "none"
 
         stream = None
         try:

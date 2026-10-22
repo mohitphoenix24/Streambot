@@ -184,7 +184,7 @@ Browser ── message ──▶ FastAPI ──▶ OpenAI (tools: web_search)
                       OpenAI ── answer with inline [1] [2] ──▶ SSE ──▶ browser (chips + source cards)
 ```
 
-- The loop lives in `OpenAILLM._stream_agent`. Each round is one streamed request; when a round ends with a function call we run the tool, append the model's output items (including encrypted reasoning, needed because `store=False`) and a `function_call_output`, and ask again. After `AGENT_MAX_SEARCHES` searches the next request sets `tool_choice="none"`, so the model has to answer.
+- The loop lives in `OpenAILLM._stream_agent`. Each round is one streamed request; when a round ends with a function call we run the tool, append the model's output items (including encrypted reasoning, needed because `store=False`) and a `function_call_output`, and ask again. The loop ends when a round has no function call, and there is no cap on the number of searches (Stop always cancels, and each round is bounded by `MAX_OUTPUT_TOKENS`).
 - Retries wrap a single round and tools run only after a round completes, so a retried request never repeats a search. Token usage and cost are summed over all rounds.
 - The UI shows `tool_call`/`tool_result` live, then renders `[n]` as clickable chips and lists the sources under the reply. Sources are stored with the message (`messages.sources`), so they survive a refresh. Markers that match no source stay plain text.
 - Citation numbers belong to one reply. The system prompt tells the model never to reuse markers from earlier messages.
@@ -201,7 +201,6 @@ See [.env.example](.env.example) for the annotated file.
 | `OPENAI_TITLE_MODEL` | `OPENAI_MODEL` | cheaper model for titles (model routing) |
 | `TAVILY_API_KEY` | – | enables the web search tool; empty = tool not offered |
 | `WEB_SEARCH_MAX_RESULTS` | `5` | results the model gets per search |
-| `AGENT_MAX_SEARCHES` | `10` | max web searches per reply; after that the model must answer |
 | `OPENAI_TIMEOUT_S` | `60` | connect/inter-chunk timeout |
 | `MAX_OUTPUT_TOKENS` | `1024` | cap on generated tokens per reply |
 | `HISTORY_BUDGET_TOKENS` | `6000` | budget for past messages (not the context window) |
@@ -526,7 +525,7 @@ cd frontend && npm run typecheck && npm test                   # TS typecheck + 
 | `test_db.py` | create/get/update/list, FK + CHECK constraints, crash recovery, totals |
 | `test_streaming_failure.py` | **stream failure** (`"Hello "`, `"world"`, then raise → DB `"Hello world"` + `error` + SSE error event), no leaked internals, cancellation (disconnect + task cancel), checkpointing, placeholder row |
 | `test_retry.py` | retry before first token, **no retry after**, bounded, backoff, `Retry-After` |
-| `test_llm.py` | OpenAI adapter against a stub SDK client: request shape, event mapping, error classification, the agent loop (tool call → output → answer, summed usage, search cap, retries never repeat a search) |
+| `test_llm.py` | OpenAI adapter against a stub SDK client: request shape, event mapping, error classification, the agent loop (tool call → output → answer, summed usage, parallel calls, no search limit, retries never repeat a search) |
 | `test_web_search.py` | Tavily parsing, URL filtering, safe errors, citation numbering across searches |
 | `test_api.py` | endpoints, history reaches the model, titles, 413/422/409/429, restart persistence |
 | `test_cancellation_live.py` | real Uvicorn + real TCP disconnect |

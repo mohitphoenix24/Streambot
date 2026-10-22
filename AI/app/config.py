@@ -48,7 +48,6 @@ class Settings:
     # Web search tool. No key = the tool is simply not offered.
     tavily_api_key: str | None = None
     web_search_max_results: int = 5
-    agent_max_searches: int = 10  # tool calls per reply; after that the model must answer
     max_output_tokens: int = 1024
 
     # The context window is the MODEL's hard limit. This is OUR budget for the
@@ -144,7 +143,6 @@ class Settings:
             system_prompt=text("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT) or DEFAULT_SYSTEM_PROMPT,
             tavily_api_key=text("TAVILY_API_KEY"),
             web_search_max_results=number("WEB_SEARCH_MAX_RESULTS", 5, integer=True, minimum=1),
-            agent_max_searches=number("AGENT_MAX_SEARCHES", 10, integer=True, minimum=1),
             max_output_tokens=number("MAX_OUTPUT_TOKENS", 1024, integer=True, minimum=16),
             history_budget_tokens=number("HISTORY_BUDGET_TOKENS", 6000, integer=True, minimum=1),
             usd_to_inr=None if (text("USD_TO_INR", "auto") or "auto").lower() == "auto"
